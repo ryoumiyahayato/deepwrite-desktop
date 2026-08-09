@@ -2,7 +2,7 @@
 
 DeepWrite 是一个 local-first 的 Windows 长篇写作桌面软件。它提供接近传统文字处理器的富文本编辑体验，并把 DeepSeek 写作分析作为可选择、可审阅、可拒绝的修改建议，而不是让模型直接覆盖原文。
 
-> 当前状态：`0.1.0` 第一阶段可运行产品。核心编辑、独立 `.dwrite` 文档、安全保存、恢复、版本历史、DeepSeek 结构化建议、基础 DOCX 导入/导出已经实现。复杂 Word 排版、精确分页和完全无损 round-trip 不在本阶段保证范围内。
+> 当前状态：`0.1.1` 第一阶段可运行产品。核心编辑、独立 `.dwrite` 文档、安全保存、恢复、版本历史、DeepSeek 结构化建议、基础 DOCX 导入/导出已经实现。Windows NSIS 安装包内置 WebView2 Evergreen Offline Installer。复杂 Word 排版、精确分页和完全无损 round-trip 不在本阶段保证范围内。
 
 ## 主要功能
 
@@ -54,7 +54,7 @@ Tauri 2 / Rust
 - pnpm 11+
 - Rust stable（通过 rustup，MSVC target）
 - Microsoft Visual Studio 2022 Build Tools，包含“使用 C++ 的桌面开发”与 Windows SDK
-- Microsoft Edge WebView2 Runtime
+- Microsoft Edge WebView2 Runtime（仅本地开发运行需要；正式 NSIS 安装包会在需要时静默安装其内置的 Evergreen Runtime）
 - 构建 MSI 时需要 WiX（Tauri 会按其工具链要求处理）
 
 参考 [Tauri 2 Windows prerequisites](https://v2.tauri.app/start/prerequisites/)。
@@ -86,6 +86,7 @@ pnpm dev
 pnpm typecheck
 pnpm lint
 pnpm test
+pnpm validate:windows-bundle
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
@@ -96,13 +97,18 @@ cargo check --manifest-path src-tauri/Cargo.toml
 
 ```powershell
 pnpm build
-pnpm tauri build
+pnpm tauri build --bundles nsis
+pnpm validate:windows-artifact
 ```
 
 Windows 安装包输出在：
 
 - `src-tauri/target/release/bundle/nsis/`
 - `src-tauri/target/release/bundle/msi/`（需要可用的 WiX 工具链）
+
+发布配置显式使用 Tauri 2 的 `offlineInstaller` 模式，并保持 NSIS `currentUser` 安装范围；安装器无需联网下载 WebView2，也不会仅为安装 DeepWrite 而强制请求管理员权限。若系统没有可用 Runtime，NSIS 会从安装包中的 Microsoft Evergreen Offline Installer 静默安装。相较在线 bootstrapper，这会显著增大安装包体积：Tauri 文档给出的典型增量约为 127 MB，但 Microsoft payload 会随版本变化，实际 x64 安装包达到 200 MB 以上也属于预期行为。
+
+`pnpm validate:windows-bundle` 解析配置并阻止 `offlineInstaller` 或安装范围被意外改回。构建后运行 `pnpm validate:windows-artifact`，它还会验证安装包大小、生成的 NSIS 模式以及 WebView2 离线 payload。若安装仍提示找不到 Runtime，请保留安装器退出码和系统 WebView2/Edge Updater 状态用于诊断；正式发布不应要求用户手动下载 Runtime。
 
 ## DeepSeek API 设置
 

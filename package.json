@@ -1,7 +1,7 @@
 {
   "name": "deepwrite-desktop",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local-first long-form writing desktop editor with DeepSeek-assisted revision.",
   "license": "MIT",
   "type": "module",
@@ -11,7 +11,9 @@
     "lint": "eslint . --max-warnings=0",
     "test": "vitest run",
     "test:watch": "vitest",
-    "build": "tsc && vite build",
+    "validate:windows-bundle": "node scripts/validate-windows-bundle.mjs",
+    "validate:windows-artifact": "node scripts/validate-windows-bundle.mjs --release",
+    "build": "node scripts/validate-windows-bundle.mjs && tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri"
   },
