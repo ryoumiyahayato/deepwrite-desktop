@@ -1,0 +1,53 @@
+# JavaScript / frontend build output
+node_modules/
+dist/
+coverage/
+.vite/
+*.tsbuildinfo
+
+# Rust / Tauri build output
+src-tauri/target/
+target/
+
+# Environment and credentials (the application does not read API keys from env)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# DeepWrite user data and secrets
+*.dwrite
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.hold
+*.vault
+*.salt
+recovery/
+autosave/
+
+# User documents and private exports
+user-documents/
+private-documents/
+
+# Logs, crash output and test artifacts
+*.log
+logs/
+crash-reports/
+test-results/
+playwright-report/
+
+# Local editor / OS files
+.idea/
+.vs/
+*.user
+*.suo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary atomic-write artifacts
+.*.tmp
+*.bak
