@@ -1,86 +1,84 @@
 # DeepWrite Desktop
 
-DeepWrite 是一个 local-first 的 Windows 长篇写作桌面软件。它提供接近传统文字处理器的富文本编辑体验，并把 DeepSeek 写作分析作为可选择、可审阅、可拒绝的修改建议，而不是让模型直接覆盖原文。
+DeepWrite is a local-first Windows desktop application for long-form writing. It provides a rich-text editing experience similar to a traditional word processor, while presenting DeepSeek-powered writing analysis as optional, reviewable, and rejectable suggestions rather than allowing the model to overwrite the original text directly.
 
-> 当前状态：`0.1.1` 第一阶段可运行产品。核心编辑、独立 `.dwrite` 文档、安全保存、恢复、版本历史、DeepSeek 结构化建议、基础 DOCX 导入/导出已经实现。Windows NSIS 安装包内置 WebView2 Evergreen Offline Installer。复杂 Word 排版、精确分页和完全无损 round-trip 不在本阶段保证范围内。
+> Current status: `0.1.1`, a runnable Phase 1 product. Core editing, standalone `.dwrite` documents, safe saving, recovery, version history, structured DeepSeek suggestions, and basic DOCX import/export have been implemented. The Windows NSIS installer bundles the WebView2 Evergreen Offline Installer. Complex Word formatting, exact pagination, and fully lossless round-trip fidelity are not guaranteed at this stage.
 
-## 主要功能
+## Main Features
 
-- Tiptap 开源核心富文本编辑：正文、Heading 1–3、字体/字号、粗体、斜体、下划线、删除线、颜色、高亮、四种对齐、缩进、行距、列表、引用、链接、水平线。
-- 表格操作：插入，增加/删除行列，删除表格。
-- 本地图片：插入 data URI 图片和基础宽度缩放。
-- 自定义分页符节点；打印时转换为真正的 page break。
-- Windows 快捷键：`Ctrl+N/O/S/Shift+S/Z/Y/F/H/B/I/U`，以及标准剪切、复制、粘贴、全选。
-- `.dwrite` 独立 JSON 文档，正文不依赖 SQLite 才能恢复。
-- 同目录临时文件 + Windows `MoveFileExW` replace/write-through 安全写入。
-- 1.5 秒防抖自动保存、异常 recovery、最近文件、可恢复版本历史。
-- DeepSeek API Key 由用户在设置中填写；Stronghold 主密码由 Windows 凭据管理器保护，Key 保存在 Stronghold 加密保险库。
-- DeepSeek JSON Output + Zod 严格 runtime validation；失败自动修复/重试一次。
-- 校对、轻/深度润色、精简、扩写、重写、逻辑、矛盾、人物一致性、续写、自定义要求。
-- suggestion 原文删除线 + 新增双下划线/背景标记；接受、拒绝、全部接受、全部拒绝。
-- 文档 ID、revision、selection identity、原文 hash 并发保护；原文变化后建议标记为过期，禁止直接覆盖。
-- 停笔自动分析（关闭/1/3/5/10/15 分钟），相同 hash 不重复调用，只发送近期段落并遵守上下文上限。
-- 导入 `.dwrite/.docx/.txt/.md/.html`，导出 `.dwrite/.docx/.txt/.md/.html`，支持系统打印/PDF。
+* Tiptap open-source core rich-text editing: body text, Heading 1–3, font family/size, bold, italic, underline, strikethrough, text color, highlighting, four alignment modes, indentation, line spacing, lists, block quotes, links, and horizontal rules.
+* Table operations: insert tables, add/remove rows and columns, and delete tables.
+* Local images: insert data URI images with basic width scaling.
+* Custom page-break nodes that are converted into real page breaks when printing.
+* Windows shortcuts: `Ctrl+N/O/S/Shift+S/Z/Y/F/H/B/I/U`, plus standard cut, copy, paste, and select-all shortcuts.
+* Standalone `.dwrite` JSON documents whose main content does not depend on SQLite for recovery.
+* Safe writes using temporary files in the same directory plus Windows `MoveFileExW` replace/write-through behavior.
+* 1.5-second debounced autosave, crash recovery, recent files, and restorable version history.
+* The DeepSeek API Key is entered by the user in Settings. The Stronghold master password is protected by Windows Credential Manager, while the Key itself is stored in an encrypted Stronghold vault.
+* DeepSeek JSON Output with strict Zod runtime validation; failed responses are automatically repaired/retried once.
+* Proofreading, light/deep polishing, shortening, expansion, rewriting, logic review, contradiction detection, character consistency, continuation writing, and custom instructions.
+* Suggestions display deleted original text with strikethrough and added text with double underline/background highlighting; users can accept, reject, accept all, or reject all.
+* Concurrency protection using document ID, revision, selection identity, and original-text hash. Suggestions are marked stale when the source text changes and cannot directly overwrite modified content.
+* Automatic analysis after writing pauses: Off / 1 / 3 / 5 / 10 / 15 minutes. Identical hashes are not submitted repeatedly; only recent paragraphs are sent, within the configured context limit.
+* Import `.dwrite/.docx/.txt/.md/.html`; export `.dwrite/.docx/.txt/.md/.html`; supports system printing/PDF output.
 
-## 截图
+## Screenshots
 
-![DeepWrite 主窗口](docs/screenshots/main-window.png)
+Implementation screenshots are stored in `docs/screenshots/main-window.png`, and the visual design reference is stored in `docs/screenshots/deepwrite-concept.png`.
 
-实现截图保存在 `docs/screenshots/main-window.png`，视觉设计基准保存在 `docs/screenshots/deepwrite-concept.png`。
-
-## 技术架构
+## Technical Architecture
 
 ```text
 React + TypeScript + Vite
-  ├─ Tiptap / ProseMirror：编辑器、表格、自定义分页符与 suggestion decorations
-  ├─ Zod：.dwrite 与 AI JSON runtime validation
-  ├─ Mammoth：DOCX → HTML → Tiptap
-  ├─ docx：Tiptap JSON → DOCX
-  └─ Tauri JS plugins：Dialog / SQL / Stronghold
+  ├─ Tiptap / ProseMirror: editor, tables, custom page breaks, and suggestion decorations
+  ├─ Zod: .dwrite and AI JSON runtime validation
+  ├─ Mammoth: DOCX → HTML → Tiptap
+  ├─ docx: Tiptap JSON → DOCX
+  └─ Tauri JS plugins: Dialog / SQL / Stronghold
 
 Tauri 2 / Rust
-  ├─ 安全原子写入与 recovery 文件
-  ├─ DeepSeek HTTPS 请求（不记录 Key 或正文）
+  ├─ Safe atomic writes and recovery files
+  ├─ DeepSeek HTTPS requests (without logging Keys or document content)
   ├─ Stronghold + Windows Credential Manager
-  └─ SQLite migrations：最近文件、设置、版本、AI 建议索引、历史信息
+  └─ SQLite migrations: recent files, settings, versions, AI suggestion indexes, and history metadata
 ```
 
-程序不包含服务器、账号系统、云同步、多人协作或遥测。
+The application does not include a server, account system, cloud synchronization, multi-user collaboration, or telemetry.
 
-## Windows 开发环境要求
+## Windows Development Requirements
 
-- Windows 10/11 x64
-- Node.js 22+
-- pnpm 11+
-- Rust stable（通过 rustup，MSVC target）
-- Microsoft Visual Studio 2022 Build Tools，包含“使用 C++ 的桌面开发”与 Windows SDK
-- Microsoft Edge WebView2 Runtime（仅本地开发运行需要；正式 NSIS 安装包会在需要时静默安装其内置的 Evergreen Runtime）
-- 构建 MSI 时需要 WiX（Tauri 会按其工具链要求处理）
+* Windows 10/11 x64
+* Node.js 22+
+* pnpm 11+
+* Rust stable via rustup, with the MSVC target
+* Microsoft Visual Studio 2022 Build Tools with “Desktop development with C++” and the Windows SDK
+* Microsoft Edge WebView2 Runtime, required only for local development; the production NSIS installer silently installs its bundled Evergreen Runtime when needed
+* WiX is required when building MSI packages; Tauri handles it according to its toolchain requirements
 
-参考 [Tauri 2 Windows prerequisites](https://v2.tauri.app/start/prerequisites/)。
+See the [Tauri 2 Windows prerequisites](https://v2.tauri.app/start/prerequisites/).
 
-## 安装依赖
+## Installing Dependencies
 
 ```powershell
 pnpm install
 pnpm approve-builds esbuild
 ```
 
-项目使用 `pnpm-lock.yaml`。不要无理由改用 Bun。
+The project uses `pnpm-lock.yaml`. Do not switch to Bun without a specific reason.
 
-## 开发运行
+## Development
 
 ```powershell
 pnpm tauri dev
 ```
 
-仅预览 Web 前端（文件系统、SQLite、Stronghold 和 DeepSeek Rust 命令不可用）：
+To preview only the Web frontend, where filesystem access, SQLite, Stronghold, and DeepSeek Rust commands are unavailable:
 
 ```powershell
 pnpm dev
 ```
 
-## 测试和检查
+## Tests and Checks
 
 ```powershell
 pnpm typecheck
@@ -91,9 +89,9 @@ cargo test --manifest-path src-tauri/Cargo.toml
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
-测试覆盖文档序列化、损坏/未来 schema 拒绝、AI response schema、hash/stale suggestion、停笔分析去重、自动保存防抖和基础 DOCX 导出。
+Tests cover document serialization, rejection of corrupted/future schemas, AI response schemas, hash/stale-suggestion handling, pause-analysis deduplication, autosave debouncing, and basic DOCX export.
 
-## Production 构建
+## Production Build
 
 ```powershell
 pnpm build
@@ -101,69 +99,77 @@ pnpm tauri build --bundles nsis
 pnpm validate:windows-artifact
 ```
 
-Windows 安装包输出在：
+Windows installer outputs are located at:
 
-- `src-tauri/target/release/bundle/nsis/`
-- `src-tauri/target/release/bundle/msi/`（需要可用的 WiX 工具链）
+* `src-tauri/target/release/bundle/nsis/`
+* `src-tauri/target/release/bundle/msi/` (requires a working WiX toolchain)
 
-发布配置显式使用 Tauri 2 的 `offlineInstaller` 模式，并保持 NSIS `currentUser` 安装范围；安装器无需联网下载 WebView2，也不会仅为安装 DeepWrite 而强制请求管理员权限。若系统没有可用 Runtime，NSIS 会从安装包中的 Microsoft Evergreen Offline Installer 静默安装。相较在线 bootstrapper，这会显著增大安装包体积：Tauri 文档给出的典型增量约为 127 MB，但 Microsoft payload 会随版本变化，实际 x64 安装包达到 200 MB 以上也属于预期行为。
+The release configuration explicitly uses Tauri 2's `offlineInstaller` mode and retains the NSIS `currentUser` installation scope. The installer does not need to download WebView2 over the network and does not require administrator privileges merely to install DeepWrite. If no usable Runtime is present, NSIS silently installs the Microsoft Evergreen Offline Installer bundled inside the package.
 
-`pnpm validate:windows-bundle` 解析配置并阻止 `offlineInstaller` 或安装范围被意外改回。构建后运行 `pnpm validate:windows-artifact`，它还会验证安装包大小、生成的 NSIS 模式以及 WebView2 离线 payload。若安装仍提示找不到 Runtime，请保留安装器退出码和系统 WebView2/Edge Updater 状态用于诊断；正式发布不应要求用户手动下载 Runtime。
+Compared with the online bootstrapper, this significantly increases installer size. Tauri documentation cites a typical increase of approximately 127 MB, but the Microsoft payload changes between versions, so an actual x64 installer exceeding 200 MB is also expected behavior.
 
-## DeepSeek API 设置
+`pnpm validate:windows-bundle` parses the configuration and prevents `offlineInstaller` or the installation scope from being accidentally reverted. After building, run `pnpm validate:windows-artifact`; it additionally verifies installer size, the generated NSIS mode, and the WebView2 offline payload.
 
-项目**不会附带 DeepSeek API Key**。用户必须自行提供自己的 Key。
+If installation still reports that no Runtime can be found, retain the installer exit code and the system's WebView2/Edge Updater state for diagnosis. A production release should not require users to download the Runtime manually.
 
-1. 启动 DeepWrite。
-2. 打开“设置 → AI”。
-3. 在 DeepSeek API Key 中填写 Key，点击“保存 / 修改 Key”。
-4. 使用“测试连接”；界面只显示成功/失败和经过限制的错误信息。
-5. 默认快速模型为 `deepseek-v4-flash`，默认深度模型为 `deepseek-v4-pro`。
+## DeepSeek API Configuration
 
-API Base URL 固定为 `https://api.deepseek.com/`，通过 OpenAI-compatible Chat Completions API 调用。`deepseek-chat` 和 `deepseek-reasoner` 不在允许模型列表中。
+The project **does not include a DeepSeek API Key**. Users must provide their own Key.
 
-Key 不写入源码、`.env` 或 SQLite。DeepWrite 不在 console 或错误日志中输出 Key。
+1. Launch DeepWrite.
+2. Open “Settings → AI”.
+3. Enter the Key under DeepSeek API Key and click “Save / Update Key”.
+4. Use “Test Connection”; the interface only displays success/failure and a length-limited error message.
+5. The default fast model is `deepseek-v4-flash`, and the default deep model is `deepseek-v4-pro`.
 
-## 数据保存位置
+The API Base URL is fixed to `https://api.deepseek.com/` and uses the OpenAI-compatible Chat Completions API. `deepseek-chat` and `deepseek-reasoner` are not included in the allowed-model list.
 
-- 文章：用户选择的 `.dwrite` 文件位置；它是可独立读取和恢复的格式。
-- 本地应用数据：Windows `%LOCALAPPDATA%` 下 Tauri 为 `com.deepwrite.desktop` 分配的应用目录。
-- SQLite：`deepwrite.db`，只存最近文件、设置、版本/建议索引和历史信息。
-- Stronghold：`deepwrite.vault.hold`；保险库主密码由 Windows Credential Manager 保存。
-- 异常恢复：应用数据目录中的 `recovery/pending.dwrite`，正常保存后清理。
+The Key is never written to source code, `.env`, or SQLite. DeepWrite does not output the Key to the console or error logs.
 
-这些用户数据均被 `.gitignore` 排除。
+## Data Storage Locations
 
-## 隐私说明
+* Articles: stored at the `.dwrite` path selected by the user; the format is independently readable and recoverable.
+* Local application data: the application directory assigned to `com.deepwrite.desktop` by Tauri under Windows `%LOCALAPPDATA%`.
+* SQLite: `deepwrite.db`, containing only recent files, settings, version/suggestion indexes, and history metadata.
+* Stronghold: `deepwrite.vault.hold`; the vault master password is stored in Windows Credential Manager.
+* Crash recovery: `recovery/pending.dwrite` inside the application data directory; removed after a successful normal save.
 
-文章默认仅保存在本地。只有用户主动执行 AI 功能，或明确开启“停笔自动分析”后，相关选区、有限前后文、章节摘要和作者规则才会发送到用户配置的 DeepSeek API。DeepWrite 默认不保存包含完整正文的请求日志，不包含遥测，也不向项目维护者发送数据。
+All of these user-data files are excluded by `.gitignore`.
 
-## DOCX 兼容边界
+## Privacy
 
-DOCX 导入基于 Mammoth，重点保留语义结构：普通段落、Heading 1–3、粗体、斜体、列表、链接、基础表格，以及 Mammoth 能稳定提取的图片。DOCX 导出覆盖段落、标题、粗体、斜体、下划线、对齐、列表、基础表格、data URI 图片和分页符。
+Articles are stored locally by default. Relevant selections, limited surrounding context, chapter summaries, and author rules are sent to the user-configured DeepSeek API only when the user actively invokes an AI feature or explicitly enables automatic analysis after writing pauses.
 
-复杂 Word 排版不能保证 100% round-trip fidelity。页眉页脚、修订模式、文本框、SmartArt、复杂浮动对象、宏、精确字体度量、分节与版式、域、脚注/尾注、目录域和高级表格样式可能被简化或丢失。本项目不宣称完全兼容 Microsoft Word。
+DeepWrite does not, by default, retain request logs containing the full document text. It includes no telemetry and sends no data to the project maintainer.
+
+## DOCX Compatibility Boundaries
+
+DOCX import is based on Mammoth and focuses on preserving semantic structure: normal paragraphs, Heading 1–3, bold, italic, lists, links, basic tables, and images that Mammoth can reliably extract.
+
+DOCX export supports paragraphs, headings, bold, italic, underline, alignment, lists, basic tables, data URI images, and page breaks.
+
+Complex Microsoft Word formatting is not guaranteed to survive a 100% lossless round trip. Headers and footers, Track Changes, text boxes, SmartArt, complex floating objects, macros, exact font metrics, sections and page layout, fields, footnotes/endnotes, table-of-contents fields, and advanced table styles may be simplified or lost. The project does not claim full Microsoft Word compatibility.
 
 ## Security
 
-- 禁止提交真实 API Key、用户数据库、Stronghold vault、用户文档、recovery、日志正文和构建缓存。
-- Rust DeepSeek 客户端固定 HTTPS endpoint、限制允许模型和响应错误长度。
-- AI 响应必须通过严格 Zod schema；无效 JSON 永不修改正文。
-- AI 建议接受前重新校验目标文本 hash；过期建议只能查看/复制。
-- 保存使用临时文件、flush/sync 与同卷 replace，避免破坏唯一正文。
-- 发布前运行 `git grep` 和合理的 secret pattern 扫描。
+* Never commit real API Keys, user databases, Stronghold vaults, user documents, recovery files, logs containing document text, or build caches.
+* The Rust DeepSeek client uses a fixed HTTPS endpoint, restricts allowed models, and limits response error length.
+* AI responses must pass a strict Zod schema; invalid JSON is never allowed to modify the document.
+* Before accepting an AI suggestion, the target text hash is validated again. Stale suggestions can only be viewed or copied.
+* Saves use temporary files, flush/sync, and same-volume replacement to avoid damaging the only copy of the document.
+* Before release, run `git grep` and a reasonable secret-pattern scan.
 
-安全问题请避免在公开 issue 中包含真实 Key 或私人正文。
+Do not include real API Keys or private document content in public issues when reporting security problems.
 
 ## Roadmap
 
-- 更完善的 DOCX 图片尺寸、编号层级与样式映射。
-- 多页视觉布局、页眉页脚和更可靠的打印预览。
-- 更细粒度的 block identity/rebase 机制。
-- 文档级人物/地点设定库与章节摘要管理。
-- 可选的本地全文搜索和版本差异对比。
-- 无障碍与键盘导航深度审计。
+* Improved DOCX image sizing, numbering hierarchy, and style mapping.
+* Multi-page visual layout, headers/footers, and more reliable print preview.
+* More granular block identity/rebase mechanisms.
+* Document-level character/location reference libraries and chapter-summary management.
+* Optional local full-text search and version-diff comparison.
+* In-depth accessibility and keyboard-navigation auditing.
 
 ## License
 
-MIT。直接依赖均来自 npm/crates.io 的公开软件包；发布前应随 lockfile 重新执行依赖许可证清单检查。
+MIT. Direct dependencies are publicly available packages from npm/crates.io. Before release, the dependency license inventory should be regenerated and reviewed against the lockfile.
