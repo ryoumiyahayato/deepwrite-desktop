@@ -66,6 +66,24 @@ export function createDocument(title = '未命名文档'): DeepWriteDocument {
   };
 }
 
+export function forkDocumentForSaveAs(document: DeepWriteDocument): DeepWriteDocument {
+  const now = new Date().toISOString();
+  const lineageId = typeof document.metadata.lineageId === 'string' && document.metadata.lineageId.trim()
+    ? document.metadata.lineageId
+    : document.id;
+  return {
+    ...document,
+    id: crypto.randomUUID(),
+    updatedAt: now,
+    metadata: {
+      ...document.metadata,
+      lineageId,
+      forkedFromDocumentId: document.id,
+      forkedAt: now
+    }
+  };
+}
+
 export function serializeDocument(document: DeepWriteDocument): string {
   return `${JSON.stringify(deepWriteDocumentSchema.parse(document), null, 2)}\n`;
 }
