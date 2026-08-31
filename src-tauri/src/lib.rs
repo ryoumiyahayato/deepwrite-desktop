@@ -62,7 +62,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::atomic_write_text,
             commands::atomic_write_binary,
+            commands::compare_and_swap_text,
             commands::read_text,
+            commands::read_text_if_exists,
             commands::read_binary,
             commands::write_recovery,
             commands::read_recovery,
