@@ -1,8 +1,9 @@
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::fs::{self, File};
+use std::hash::{Hash, Hasher};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Manager};
@@ -23,7 +24,7 @@ fn save_conflict(detail: &str) -> String {
 }
 
 #[cfg(windows)]
-fn replace_file(temp: &Path, destination: &Path) -> Result<(), String> {
+fn replace_file(temp: &Path, destination: &Path, replace_existing: bool) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -31,13 +32,9 @@ fn replace_file(temp: &Path, destination: &Path) -> Result<(), String> {
 
     let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
     let to: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
-    let ok = unsafe {
-        MoveFileExW(
-            from.as_ptr(),
-            to.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
+    let flags = MOVEFILE_WRITE_THROUGH
+        | if replace_existing { MOVEFILE_REPLACE_EXISTING } else { 0 };
+    let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) };
     if ok == 0 {
         Err(safe_error("无法安全替换文件", std::io::Error::last_os_error()))
     } else {
@@ -46,11 +43,17 @@ fn replace_file(temp: &Path, destination: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-fn replace_file(temp: &Path, destination: &Path) -> Result<(), String> {
+fn replace_file(temp: &Path, destination: &Path, replace_existing: bool) -> Result<(), String> {
+    if !replace_existing && destination.exists() {
+        return Err(safe_error(
+            "无法安全替换文件",
+            std::io::Error::new(std::io::ErrorKind::AlreadyExists, "目标文件已经存在"),
+        ));
+    }
     fs::rename(temp, destination).map_err(|e| safe_error("无法安全替换文件", e))
 }
 
-fn atomic_write(path: PathBuf, data: &[u8]) -> Result<(), String> {
+fn prepare_temp_file(path: &Path, data: &[u8]) -> Result<PathBuf, String> {
     let parent = path.parent().ok_or_else(|| "目标路径没有父目录".to_string())?;
     fs::create_dir_all(parent).map_err(|e| safe_error("无法创建目录", e))?;
     let file_name = path
@@ -62,9 +65,18 @@ fn atomic_write(path: PathBuf, data: &[u8]) -> Result<(), String> {
         let mut file = File::create(&temp).map_err(|e| safe_error("无法创建临时文件", e))?;
         file.write_all(data).map_err(|e| safe_error("无法写入临时文件", e))?;
         file.sync_all().map_err(|e| safe_error("无法同步临时文件", e))?;
-        drop(file);
-        replace_file(&temp, &path)
+        Ok::<(), String>(())
     })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+        result?;
+    }
+    Ok(temp)
+}
+
+fn atomic_write(path: PathBuf, data: &[u8]) -> Result<(), String> {
+    let temp = prepare_temp_file(&path, data)?;
+    let result = replace_file(&temp, &path, true);
     if result.is_err() {
         let _ = fs::remove_file(&temp);
     }
@@ -72,38 +84,60 @@ fn atomic_write(path: PathBuf, data: &[u8]) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn open_existing_for_compare(path: &Path) -> std::io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
-
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
-        .open(path)
-}
-
-#[cfg(not(windows))]
-fn open_existing_for_compare(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new().read(true).write(true).open(path)
+struct SaveMutex {
+    handle: windows_sys::Win32::Foundation::HANDLE,
 }
 
 #[cfg(windows)]
-fn reserve_new_file(path: &Path) -> std::io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+impl SaveMutex {
+    fn acquire(path: &Path) -> Result<Self, String> {
+        use std::collections::hash_map::DefaultHasher;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
 
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
-        .open(path)
+        let mut hasher = DefaultHasher::new();
+        path.to_string_lossy().to_lowercase().hash(&mut hasher);
+        let name = format!("Local\\DeepWriteSave-{:016x}", hasher.finish());
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+        if handle == 0 {
+            return Err(safe_error(
+                "无法创建文档保存互斥锁",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        let wait = unsafe { WaitForSingleObject(handle, u32::MAX) };
+        if wait != 0 && wait != 0x0000_0080 {
+            unsafe { CloseHandle(handle) };
+            return Err(safe_error(
+                "无法等待文档保存互斥锁",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        Ok(Self { handle })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for SaveMutex {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
+        unsafe {
+            ReleaseMutex(self.handle);
+            CloseHandle(self.handle);
+        }
+    }
 }
 
 #[cfg(not(windows))]
-fn reserve_new_file(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new().read(true).write(true).create_new(true).open(path)
+struct SaveMutex;
+
+#[cfg(not(windows))]
+impl SaveMutex {
+    fn acquire(_path: &Path) -> Result<Self, String> {
+        Ok(Self)
+    }
 }
 
 fn compare_and_swap_text_path(
@@ -111,38 +145,34 @@ fn compare_and_swap_text_path(
     expected_contents: Option<&str>,
     contents: &str,
 ) -> Result<(), String> {
-    let parent = path.parent().ok_or_else(|| "目标路径没有父目录".to_string())?;
-    fs::create_dir_all(parent).map_err(|e| safe_error("无法创建目录", e))?;
-
-    if let Some(expected) = expected_contents {
-        let mut locked = match open_existing_for_compare(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(save_conflict("磁盘文件已被删除或移动，请重新打开或另存为。"));
+    let temp = prepare_temp_file(&path, contents.as_bytes())?;
+    let result = (|| {
+        let _guard = SaveMutex::acquire(&path)?;
+        if let Some(expected) = expected_contents {
+            let current = match fs::read_to_string(&path) {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(save_conflict("磁盘文件已被删除或移动，请重新打开或另存为。"));
+                }
+                Err(error) => return Err(safe_error("无法读取目标文件进行冲突检查", error)),
+            };
+            if current != expected {
+                return Err(save_conflict("磁盘文件自上次读取后已被其他实例或程序修改；DeepWrite 未覆盖这些外部修改。"));
             }
-            Err(error) => return Err(safe_error("无法锁定目标文件进行冲突检查", error)),
-        };
-        let mut current = String::new();
-        locked
-            .read_to_string(&mut current)
-            .map_err(|e| safe_error("无法读取目标文件进行冲突检查", e))?;
-        if current != expected {
-            return Err(save_conflict("磁盘文件自上次读取后已被其他实例或程序修改；DeepWrite 未覆盖这些外部修改。"));
+            return replace_file(&temp, &path, true);
         }
-        return atomic_write(path, contents.as_bytes());
-    }
 
-    let reservation = match reserve_new_file(&path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+        if path.exists() {
             return Err(save_conflict("目标文件在保存前已被创建或替换，请重新选择保存位置。"));
         }
-        Err(error) => return Err(safe_error("无法预留新的文档路径", error)),
-    };
-    let result = atomic_write(path.clone(), contents.as_bytes());
-    drop(reservation);
+        match replace_file(&temp, &path, false) {
+            Ok(()) => Ok(()),
+            Err(_) if path.exists() => Err(save_conflict("目标文件在保存过程中已被其他实例或程序创建；DeepWrite 未覆盖该文件。")),
+            Err(error) => Err(error),
+        }
+    })();
     if result.is_err() {
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&temp);
     }
     result
 }
