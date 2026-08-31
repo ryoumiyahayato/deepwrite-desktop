@@ -3,6 +3,7 @@ import { marked } from 'marked';
 import TurndownService from 'turndown';
 import {
   createDocument,
+  forkDocumentForSaveAs,
   parseDocument,
   serializeDocument,
   type DeepWriteDocument
@@ -12,16 +13,24 @@ import {
   atomicWriteText,
   chooseOpenPath,
   chooseSavePath,
+  compareAndSwapText,
   extensionFromPath,
   fileNameFromPath,
   invokeCommand,
   readBinary,
-  readText
+  readText,
+  readTextIfExists
 } from './platform';
 
 export type ImportedContent =
-  | { kind: 'document'; document: DeepWriteDocument; path: string; warnings: string[] }
+  | { kind: 'document'; document: DeepWriteDocument; path: string; diskContents: string; warnings: string[] }
   | { kind: 'html'; html: string; title: string; sourcePath: string; warnings: string[] };
+
+export interface SavedDwrite {
+  path: string;
+  document: DeepWriteDocument;
+  diskContents: string;
+}
 
 const htmlEscape = (input: string) => input.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char] ?? char);
 
@@ -32,7 +41,10 @@ export async function chooseAndOpenDocument(): Promise<ImportedContent | null> {
 
 export async function openDocumentAtPath(path: string): Promise<ImportedContent> {
   const extension = extensionFromPath(path);
-  if (extension === 'dwrite') return { kind: 'document', document: parseDocument(await readText(path)), path, warnings: [] };
+  if (extension === 'dwrite') {
+    const diskContents = await readText(path);
+    return { kind: 'document', document: parseDocument(diskContents), path, diskContents, warnings: [] };
+  }
   if (extension === 'docx') {
     const { importDocx } = await import('./docx');
     const imported = await importDocx(await readBinary(path));
@@ -53,12 +65,32 @@ function suggestedPath(directory: string, fileName: string): string {
   return trimmed ? `${trimmed}\\${fileName}` : fileName;
 }
 
-export async function saveDwrite(document: DeepWriteDocument, currentPath: string | null, saveAs = false, defaultDirectory = ''): Promise<string | null> {
+function normalizedPath(path: string): string {
+  return path.replace(/\//g, '\\').replace(/\\+/g, '\\').toLocaleLowerCase('en-US');
+}
+
+export function sameDocumentPath(left: string | null, right: string | null): boolean {
+  return Boolean(left && right && normalizedPath(left) === normalizedPath(right));
+}
+
+export async function saveDwrite(
+  document: DeepWriteDocument,
+  currentPath: string | null,
+  saveAs = false,
+  defaultDirectory = '',
+  expectedDiskContents: string | null = null
+): Promise<SavedDwrite | null> {
   let path = saveAs ? null : currentPath;
   if (!path) path = await chooseSavePath(suggestedPath(defaultDirectory, `${document.title || '未命名文档'}.dwrite`), ['dwrite'], 'DeepWrite 文档');
   if (!path) return null;
-  await atomicWriteText(path, serializeDocument(document));
-  return path;
+
+  const writingCurrentPath = sameDocumentPath(path, currentPath);
+  const isFork = saveAs && Boolean(currentPath) && !writingCurrentPath;
+  const savedDocument = isFork ? forkDocumentForSaveAs(document) : document;
+  const targetBaseline = writingCurrentPath ? expectedDiskContents : await readTextIfExists(path);
+  const diskContents = serializeDocument(savedDocument);
+  await compareAndSwapText(path, targetBaseline, diskContents);
+  return { path, document: savedDocument, diskContents };
 }
 
 export async function exportDocument(
