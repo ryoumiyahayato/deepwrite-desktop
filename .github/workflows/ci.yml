@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'fix/**'
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  web:
+    name: TypeScript and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm typecheck
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm validate:windows-bundle
+      - run: pnpm build
+
+  rust-windows:
+    name: Rust Windows checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+      - run: cargo check --manifest-path src-tauri/Cargo.toml
