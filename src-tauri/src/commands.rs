@@ -1,8 +1,8 @@
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Manager};
@@ -16,6 +16,10 @@ fn safe_error(context: &str, error: impl std::fmt::Display) -> String {
     let detail = error.to_string();
     let trimmed: String = detail.chars().take(300).collect();
     format!("{context}: {trimmed}")
+}
+
+fn save_conflict(detail: &str) -> String {
+    format!("保存冲突：{detail}")
 }
 
 #[cfg(windows)]
@@ -67,6 +71,82 @@ fn atomic_write(path: PathBuf, data: &[u8]) -> Result<(), String> {
     result
 }
 
+#[cfg(windows)]
+fn open_existing_for_compare(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn open_existing_for_compare(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().read(true).write(true).open(path)
+}
+
+#[cfg(windows)]
+fn reserve_new_file(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .open(path)
+}
+
+#[cfg(not(windows))]
+fn reserve_new_file(path: &Path) -> std::io::Result<File> {
+    OpenOptions::new().read(true).write(true).create_new(true).open(path)
+}
+
+fn compare_and_swap_text_path(
+    path: PathBuf,
+    expected_contents: Option<&str>,
+    contents: &str,
+) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(|| "目标路径没有父目录".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| safe_error("无法创建目录", e))?;
+
+    if let Some(expected) = expected_contents {
+        let mut locked = match open_existing_for_compare(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(save_conflict("磁盘文件已被删除或移动，请重新打开或另存为。"));
+            }
+            Err(error) => return Err(safe_error("无法锁定目标文件进行冲突检查", error)),
+        };
+        let mut current = String::new();
+        locked
+            .read_to_string(&mut current)
+            .map_err(|e| safe_error("无法读取目标文件进行冲突检查", e))?;
+        if current != expected {
+            return Err(save_conflict("磁盘文件自上次读取后已被其他实例或程序修改；DeepWrite 未覆盖这些外部修改。"));
+        }
+        return atomic_write(path, contents.as_bytes());
+    }
+
+    let reservation = match reserve_new_file(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(save_conflict("目标文件在保存前已被创建或替换，请重新选择保存位置。"));
+        }
+        Err(error) => return Err(safe_error("无法预留新的文档路径", error)),
+    };
+    let result = atomic_write(path.clone(), contents.as_bytes());
+    drop(reservation);
+    if result.is_err() {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
 #[tauri::command]
 pub fn atomic_write_text(path: String, contents: String) -> Result<(), String> {
     atomic_write(PathBuf::from(path), contents.as_bytes())
@@ -78,8 +158,26 @@ pub fn atomic_write_binary(path: String, contents: Vec<u8>) -> Result<(), String
 }
 
 #[tauri::command]
+pub fn compare_and_swap_text(
+    path: String,
+    expected_contents: Option<String>,
+    contents: String,
+) -> Result<(), String> {
+    compare_and_swap_text_path(PathBuf::from(path), expected_contents.as_deref(), &contents)
+}
+
+#[tauri::command]
 pub fn read_text(path: String) -> Result<String, String> {
     fs::read_to_string(path).map_err(|e| safe_error("无法读取文件", e))
+}
+
+#[tauri::command]
+pub fn read_text_if_exists(path: String) -> Result<Option<String>, String> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(safe_error("无法读取目标文件", error)),
+    }
 }
 
 #[tauri::command]
@@ -316,5 +414,30 @@ mod tests {
         assert!(!first.contains('/'));
         assert!(!first.contains(".."));
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn conditional_write_rejects_external_changes_without_overwriting_them() {
+        let path = std::env::temp_dir().join(format!("deepwrite-cas-{}.dwrite", Uuid::new_v4()));
+        fs::write(&path, "baseline").unwrap();
+        compare_and_swap_text_path(path.clone(), Some("baseline"), "ours").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "ours");
+
+        fs::write(&path, "external").unwrap();
+        let error = compare_and_swap_text_path(path.clone(), Some("ours"), "new ours").unwrap_err();
+        assert!(error.contains("保存冲突"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn conditional_write_creates_only_when_target_is_still_missing() {
+        let path = std::env::temp_dir().join(format!("deepwrite-new-{}.dwrite", Uuid::new_v4()));
+        compare_and_swap_text_path(path.clone(), None, "first").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+        let error = compare_and_swap_text_path(path.clone(), None, "second").unwrap_err();
+        assert!(error.contains("保存冲突"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+        let _ = fs::remove_file(path);
     }
 }
