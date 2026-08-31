@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
 
@@ -87,34 +87,86 @@ pub fn read_binary(path: String) -> Result<Vec<u8>, String> {
     fs::read(path).map_err(|e| safe_error("无法读取文件", e))
 }
 
-fn recovery_path(app: &AppHandle) -> Result<PathBuf, String> {
+fn recovery_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_local_data_dir()
-        .map(|path| path.join("recovery").join("pending.dwrite"))
+        .map(|path| path.join("recovery"))
         .map_err(|e| safe_error("无法定位恢复目录", e))
 }
 
+fn recovery_file_name(document_id: &str) -> String {
+    format!("{}.dwrite", hex::encode(document_id.as_bytes()))
+}
+
+fn recovery_path(app: &AppHandle, document_id: &str) -> Result<PathBuf, String> {
+    Ok(recovery_dir(app)?.join(recovery_file_name(document_id)))
+}
+
+fn recovery_document_id(contents: &str) -> Option<String> {
+    serde_json::from_str::<Value>(contents)
+        .ok()
+        .and_then(|value| value.get("id").and_then(Value::as_str).map(str::to_owned))
+}
+
 #[tauri::command]
-pub fn write_recovery(app: AppHandle, contents: String) -> Result<(), String> {
-    atomic_write(recovery_path(&app)?, contents.as_bytes())
+pub fn write_recovery(app: AppHandle, document_id: String, contents: String) -> Result<(), String> {
+    if document_id.trim().is_empty() {
+        return Err("恢复文档 ID 不能为空".into());
+    }
+    atomic_write(recovery_path(&app, &document_id)?, contents.as_bytes())
 }
 
 #[tauri::command]
 pub fn read_recovery(app: AppHandle) -> Result<Option<String>, String> {
-    let path = recovery_path(&app)?;
-    if !path.exists() {
+    let directory = recovery_dir(&app)?;
+    if !directory.exists() {
         return Ok(None);
     }
-    fs::read_to_string(path)
-        .map(Some)
-        .map_err(|e| safe_error("无法读取恢复内容", e))
+
+    let mut candidates: Vec<(SystemTime, PathBuf)> = fs::read_dir(&directory)
+        .map_err(|e| safe_error("无法读取恢复目录", e))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("dwrite") {
+                return None;
+            }
+            let modified = entry
+                .metadata()
+                .ok()
+                .and_then(|metadata| metadata.modified().ok())
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((modified, path))
+        })
+        .collect();
+    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+
+    for (_, path) in candidates {
+        if let Ok(contents) = fs::read_to_string(&path) {
+            if recovery_document_id(&contents).is_some() {
+                return Ok(Some(contents));
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[tauri::command]
-pub fn clear_recovery(app: AppHandle) -> Result<(), String> {
-    let path = recovery_path(&app)?;
+pub fn clear_recovery(app: AppHandle, document_id: String) -> Result<(), String> {
+    let path = recovery_path(&app, &document_id)?;
     if path.exists() {
-        fs::remove_file(path).map_err(|e| safe_error("无法清理恢复内容", e))?;
+        fs::remove_file(&path).map_err(|e| safe_error("无法清理恢复内容", e))?;
+    }
+
+    let legacy = recovery_dir(&app)?.join("pending.dwrite");
+    if legacy.exists() {
+        let should_remove = fs::read_to_string(&legacy)
+            .ok()
+            .and_then(|contents| recovery_document_id(&contents))
+            .is_some_and(|id| id == document_id);
+        if should_remove {
+            fs::remove_file(legacy).map_err(|e| safe_error("无法清理旧版恢复内容", e))?;
+        }
     }
     Ok(())
 }
@@ -254,5 +306,15 @@ mod tests {
     fn error_messages_are_bounded() {
         let message = safe_error("test", "x".repeat(1000));
         assert!(message.len() < 320);
+    }
+
+    #[test]
+    fn recovery_names_are_path_safe_and_document_specific() {
+        let first = recovery_file_name("doc/../one");
+        let second = recovery_file_name("doc/../two");
+        assert!(first.ends_with(".dwrite"));
+        assert!(!first.contains('/'));
+        assert!(!first.contains(".."));
+        assert_ne!(first, second);
     }
 }
