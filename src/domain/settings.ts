@@ -4,7 +4,8 @@ export const settingsSchema = z.object({
   general: z.object({
     defaultSaveDirectory: z.string(),
     autosaveEnabled: z.boolean(),
-    recentFilesLimit: z.number().int().min(1).max(50)
+    recentFilesLimit: z.number().int().min(1).max(50),
+    versionHistoryLimit: z.number().int().min(0).max(500).default(50)
   }),
   editor: z.object({
     defaultFont: z.string(),
@@ -24,7 +25,7 @@ export const settingsSchema = z.object({
 export type AppSettings = z.infer<typeof settingsSchema>;
 
 export const defaultSettings: AppSettings = {
-  general: { defaultSaveDirectory: '', autosaveEnabled: true, recentFilesLimit: 12 },
+  general: { defaultSaveDirectory: '', autosaveEnabled: true, recentFilesLimit: 12, versionHistoryLimit: 50 },
   editor: { defaultFont: '思源宋体', defaultFontSize: 16, defaultLineHeight: 1.75 },
   ai: {
     fastModel: 'deepseek-v4-flash',
