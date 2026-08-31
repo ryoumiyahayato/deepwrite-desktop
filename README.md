@@ -2,7 +2,7 @@
 
 DeepWrite is a local-first Windows desktop application for long-form writing. It provides a rich-text editing experience similar to a traditional word processor, while presenting DeepSeek-powered writing analysis as optional, reviewable, and rejectable suggestions rather than allowing the model to overwrite the original text directly.
 
-> Current status: `0.1.1`, a runnable Phase 1 product. Core editing, standalone `.dwrite` documents, safe saving, recovery, version history, structured DeepSeek suggestions, and basic DOCX import/export have been implemented. The Windows NSIS installer bundles the WebView2 Evergreen Offline Installer. Complex Word formatting, exact pagination, and fully lossless round-trip fidelity are not guaranteed at this stage.
+> Current status: `0.1.1`, a runnable Phase 1 product. Core editing, standalone `.dwrite` documents, safe saving, document-aware recovery, bounded local version history, structured DeepSeek suggestions, and basic DOCX import/export have been implemented. The Windows NSIS installer bundles the WebView2 Evergreen Offline Installer. Complex Word formatting, exact pagination, and fully lossless round-trip fidelity are not guaranteed at this stage.
 
 ## Main Features
 
@@ -11,15 +11,17 @@ DeepWrite is a local-first Windows desktop application for long-form writing. It
 * Local images: insert data URI images with basic width scaling.
 * Custom page-break nodes that are converted into real page breaks when printing.
 * Windows shortcuts: `Ctrl+N/O/S/Shift+S/Z/Y/F/H/B/I/U`, plus standard cut, copy, paste, and select-all shortcuts.
-* Standalone `.dwrite` JSON documents whose main content does not depend on SQLite for recovery.
+* Standalone `.dwrite` JSON documents whose authoritative current content does not depend on SQLite.
 * Safe writes using temporary files in the same directory plus Windows `MoveFileExW` replace/write-through behavior.
-* 1.5-second debounced autosave, crash recovery, recent files, and restorable version history.
+* 1.5-second debounced autosave, per-document crash recovery, recent files, and restorable version history.
+* New/Open/Open Recent/window-close transitions protect unsaved or failed-save states and require save or explicit discard before replacing the current document.
 * The DeepSeek API Key is entered by the user in Settings. The Stronghold master password is protected by Windows Credential Manager, while the Key itself is stored in an encrypted Stronghold vault.
 * DeepSeek JSON Output with strict Zod runtime validation; failed responses are automatically repaired/retried once.
 * Proofreading, light/deep polishing, shortening, expansion, rewriting, logic review, contradiction detection, character consistency, continuation writing, and custom instructions.
 * Suggestions display deleted original text with strikethrough and added text with double underline/background highlighting; users can accept, reject, accept all, or reject all.
-* Concurrency protection using document ID, revision, selection identity, and original-text hash. Suggestions are marked stale when the source text changes and cannot directly overwrite modified content.
-* Automatic analysis after writing pauses: Off / 1 / 3 / 5 / 10 / 15 minutes. Identical hashes are not submitted repeatedly; only recent paragraphs are sent, within the configured context limit.
+* Phase 1 concurrency protection is conservative: suggestions are tied to document ID and exact document revision, require a unique single-paragraph source span, are resolved into ProseMirror positions, and compare the exact current source text before application. Any intervening document edit makes the old suggestion non-applicable.
+* Continuation writing is a separate generated-text flow: generated continuation is reviewable/copyable and is inserted only after explicit user action if the document revision is still the one used for generation.
+* Automatic analysis after writing pauses: Off / 1 / 3 / 5 / 10 / 15 minutes. Stable hashes are used only for submission deduplication; they are not used as the final proof that text is unchanged.
 * Import `.dwrite/.docx/.txt/.md/.html`; export `.dwrite/.docx/.txt/.md/.html`; supports system printing/PDF output.
 
 ## Screenshots
@@ -37,13 +39,13 @@ React + TypeScript + Vite
   └─ Tauri JS plugins: Dialog / SQL / Stronghold
 
 Tauri 2 / Rust
-  ├─ Safe atomic writes and recovery files
+  ├─ Safe atomic writes and document-aware recovery files
   ├─ DeepSeek HTTPS requests (without logging Keys or document content)
   ├─ Stronghold + Windows Credential Manager
-  └─ SQLite migrations: recent files, settings, versions, AI suggestion indexes, and history metadata
+  └─ SQLite migrations: recent files, settings, bounded full-document version snapshots, AI suggestion metadata, and history metadata
 ```
 
-The application does not include a server, account system, cloud synchronization, multi-user collaboration, or telemetry.
+The authoritative current article is the user-selected `.dwrite` file. SQLite is local application support storage, not the authority for the current document. The application does not include a server, account system, cloud synchronization, multi-user collaboration, or telemetry.
 
 ## Windows Development Requirements
 
@@ -89,7 +91,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
-Tests cover document serialization, rejection of corrupted/future schemas, AI response schemas, hash/stale-suggestion handling, pause-analysis deduplication, autosave debouncing, and basic DOCX export.
+Tests cover document serialization, rejection of corrupted/future schemas, AI response schemas, exact stale-suggestion handling, ambiguous-anchor rejection, ProseMirror text-offset mapping, document-transition guard states, pause-analysis deduplication, autosave debouncing, recovery filename isolation, and basic DOCX export. GitHub Actions runs the JavaScript/TypeScript checks and Windows Rust checks on pushes and pull requests.
 
 ## Production Build
 
@@ -128,11 +130,12 @@ The Key is never written to source code, `.env`, or SQLite. DeepWrite does not o
 
 ## Data Storage Locations
 
-* Articles: stored at the `.dwrite` path selected by the user; the format is independently readable and recoverable.
+* Articles: the authoritative current document is stored at the `.dwrite` path selected by the user; the format is independently readable and recoverable.
 * Local application data: the application directory assigned to `com.deepwrite.desktop` by Tauri under Windows `%LOCALAPPDATA%`.
-* SQLite: `deepwrite.db`, containing only recent files, settings, version/suggestion indexes, and history metadata.
+* SQLite: `deepwrite.db`. It stores recent files, settings, local history metadata, AI suggestion metadata, and version-history snapshots. **Version snapshots contain complete historical `.dwrite` document content.** By default at most 50 snapshots are retained per document; the limit can be changed in Settings, including `0` to disable new snapshots. The current document's History dialog can delete all of its local snapshots.
+* AI suggestion history: only non-content metadata is persisted (`type`, `severity`, `status` plus document/revision indexing). Migration 2 deletes legacy suggestion rows created by 0.1.1 that could contain source/replacement text.
 * Stronghold: `deepwrite.vault.hold`; the vault master password is stored in Windows Credential Manager.
-* Crash recovery: `recovery/pending.dwrite` inside the application data directory; removed after a successful normal save.
+* Crash recovery: document-specific `.dwrite` recovery files inside the application-data `recovery/` directory. A successful save clears only the matching document's recovery file. Explicitly discarding unsaved changes also clears that document's recovery copy.
 
 All of these user-data files are excluded by `.gitignore`.
 
@@ -140,7 +143,7 @@ All of these user-data files are excluded by `.gitignore`.
 
 Articles are stored locally by default. Relevant selections, limited surrounding context, chapter summaries, and author rules are sent to the user-configured DeepSeek API only when the user actively invokes an AI feature or explicitly enables automatic analysis after writing pauses.
 
-DeepWrite does not, by default, retain request logs containing the full document text. It includes no telemetry and sends no data to the project maintainer.
+DeepWrite does not, by default, retain request logs containing the full document text and stores no document text in AI suggestion-history payloads. Local version history is different: when enabled, it deliberately retains full historical document snapshots on the user's machine so that older versions can be restored. The retention limit and deletion control are exposed to the user. DeepWrite includes no telemetry and sends no data to the project maintainer.
 
 ## DOCX Compatibility Boundaries
 
@@ -155,8 +158,9 @@ Complex Microsoft Word formatting is not guaranteed to survive a 100% lossless r
 * Never commit real API Keys, user databases, Stronghold vaults, user documents, recovery files, logs containing document text, or build caches.
 * The Rust DeepSeek client uses a fixed HTTPS endpoint, restricts allowed models, and limits response error length.
 * AI responses must pass a strict Zod schema; invalid JSON is never allowed to modify the document.
-* Before accepting an AI suggestion, the target text hash is validated again. Stale suggestions can only be viewed or copied.
-* Saves use temporary files, flush/sync, and same-volume replacement to avoid damaging the only copy of the document.
+* Before accepting an AI suggestion, DeepWrite checks document ID, exact document revision, resolved structured position, and exact current source text. Ambiguous or cross-paragraph anchors fail closed.
+* Generated continuation text is never inserted automatically and is invalidated for direct insertion by an intervening document edit.
+* Saves use temporary files, flush/sync, and same-volume replacement to avoid damaging the only copy of the document. Save completion is not allowed to clear recovery or mark the UI saved if a newer revision appeared while the write was in progress.
 * Before release, run `git grep` and a reasonable secret-pattern scan.
 
 Do not include real API Keys or private document content in public issues when reporting security problems.
@@ -165,7 +169,7 @@ Do not include real API Keys or private document content in public issues when r
 
 * Improved DOCX image sizing, numbering hierarchy, and style mapping.
 * Multi-page visual layout, headers/footers, and more reliable print preview.
-* More granular block identity/rebase mechanisms.
+* Stable per-block identities and a true rebase mechanism so safe suggestions can survive unrelated document edits instead of Phase 1's conservative whole-revision invalidation.
 * Document-level character/location reference libraries and chapter-summary management.
 * Optional local full-text search and version-diff comparison.
 * In-depth accessibility and keyboard-navigation auditing.
