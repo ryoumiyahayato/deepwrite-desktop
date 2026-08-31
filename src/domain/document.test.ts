@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { createDocument, documentStats, extractOutline, parseDocument, serializeDocument } from './document';
+import { createDocument, documentStats, extractOutline, forkDocumentForSaveAs, parseDocument, serializeDocument } from './document';
 
 describe('DeepWrite document serialization', () => {
   it('round-trips independent .dwrite JSON content', () => {
@@ -16,6 +16,20 @@ describe('DeepWrite document serialization', () => {
     expect(() => parseDocument(JSON.stringify({ schemaVersion: 1 }))).toThrow(/文档结构无效/);
     const future = createDocument(); future.schemaVersion = 99;
     expect(() => parseDocument(JSON.stringify(future))).toThrow(/更新版本/);
+  });
+
+  it('gives Save As copies an independent identity while preserving lineage', () => {
+    const source = createDocument('原稿');
+    const firstCopy = forkDocumentForSaveAs(source);
+    const secondCopy = forkDocumentForSaveAs(firstCopy);
+    expect(firstCopy.id).not.toBe(source.id);
+    expect(secondCopy.id).not.toBe(firstCopy.id);
+    expect(firstCopy.metadata.lineageId).toBe(source.id);
+    expect(secondCopy.metadata.lineageId).toBe(source.id);
+    expect(firstCopy.metadata.forkedFromDocumentId).toBe(source.id);
+    expect(secondCopy.metadata.forkedFromDocumentId).toBe(firstCopy.id);
+    expect(firstCopy.content).toEqual(source.content);
+    expect(firstCopy.revision).toBe(source.revision);
   });
 
   it('counts Chinese characters, latin words and paragraphs', () => {
