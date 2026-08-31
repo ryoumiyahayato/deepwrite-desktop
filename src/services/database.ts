@@ -69,11 +69,25 @@ export async function listRecentFiles(limit: number): Promise<RecentFile[]> {
   return rows.map((row) => ({ path: row.path, title: row.title, openedAt: row.opened_at }));
 }
 
-export async function createVersion(record: VersionRecord): Promise<void> {
-  if (!isTauri()) { memoryVersions.unshift(record); return; }
-  await (await db()).execute(
+export async function createVersion(record: VersionRecord, limit: number): Promise<void> {
+  if (limit <= 0) return;
+  if (!isTauri()) {
+    memoryVersions.unshift(record);
+    const matching = memoryVersions.filter((version) => version.documentId === record.documentId);
+    for (const obsolete of matching.slice(limit)) {
+      const index = memoryVersions.findIndex((version) => version.id === obsolete.id);
+      if (index >= 0) memoryVersions.splice(index, 1);
+    }
+    return;
+  }
+  const database = await db();
+  await database.execute(
     'INSERT INTO versions (id, document_id, document_path, created_at, reason, word_count, snapshot_json) VALUES ($1,$2,$3,$4,$5,$6,$7)',
     [record.id, record.documentId, record.documentPath, record.createdAt, record.reason, record.wordCount, JSON.stringify(record.snapshot)]
+  );
+  await database.execute(
+    'DELETE FROM versions WHERE document_id = $1 AND id NOT IN (SELECT id FROM versions WHERE document_id = $1 ORDER BY created_at DESC LIMIT $2)',
+    [record.documentId, limit]
   );
 }
 
@@ -90,12 +104,22 @@ export async function listVersions(documentId: string): Promise<VersionRecord[]>
   }));
 }
 
+export async function clearVersions(documentId: string): Promise<void> {
+  if (!isTauri()) {
+    for (let index = memoryVersions.length - 1; index >= 0; index -= 1) {
+      if (memoryVersions[index].documentId === documentId) memoryVersions.splice(index, 1);
+    }
+    return;
+  }
+  await (await db()).execute('DELETE FROM versions WHERE document_id = $1', [documentId]);
+}
+
 export async function recordSuggestions(documentId: string, revision: number, suggestions: AISuggestion[]): Promise<void> {
   if (!isTauri()) return;
   const database = await db();
   const createdAt = new Date().toISOString();
   await Promise.all(suggestions.map((suggestion) => database.execute(
     'INSERT OR REPLACE INTO ai_suggestions (id, document_id, revision, created_at, status, payload_json) VALUES ($1,$2,$3,$4,$5,$6)',
-    [suggestion.id, documentId, revision, createdAt, suggestion.status, JSON.stringify(suggestion)]
+    [suggestion.id, documentId, revision, createdAt, suggestion.status, JSON.stringify({ type: suggestion.type, severity: suggestion.severity, status: suggestion.status })]
   )));
 }
