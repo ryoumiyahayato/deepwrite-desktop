@@ -37,7 +37,7 @@ export interface AIContextInput {
 
 function promptFor(task: AITask, context: AIContextInput, repair = false): string {
   const repairInstruction = repair ? '\n上一次返回未通过 schema 校验。只返回一个严格有效的 JSON 对象，不要 Markdown。' : '';
-  return `你是中文长篇写作编辑。任务：${taskInstructions[task]}
+  const common = `你是中文长篇写作编辑。任务：${taskInstructions[task]}
 ${context.customInstruction ? `自定义要求：${context.customInstruction}` : ''}
 作者规则：
 ${context.authorRules || '无'}
@@ -47,11 +47,19 @@ ${context.authorRules || '无'}
 【目标原文】
 ${context.selected}
 【目标结束】
-后文：${context.after || '无'}
+后文：${context.after || '无'}\n`;
 
+  if (task === 'continue') {
+    return `${common}
 必须返回 JSON 对象，且只有以下字段：
-{"summary":"string","suggestions":[{"id":"string","type":"grammar|clarity|style|logic|rewrite|other","severity":"minor|medium|major","original":"必须逐字出现在目标原文中","replacement":"string","reason":"string"}],"fullRewrite":null}
-不要把建议直接应用到原文。没有问题时 suggestions 返回空数组。${repairInstruction}`;
+{"summary":"string","suggestions":[],"fullRewrite":"只包含新续写正文，不要重复目标原文"}
+续写内容放在 fullRewrite；suggestions 必须为空数组。不要把续写伪装成替换建议。${repairInstruction}`;
+  }
+
+  return `${common}
+必须返回 JSON 对象，且只有以下字段：
+{"summary":"string","suggestions":[{"id":"string","type":"grammar|clarity|style|logic|rewrite|other","severity":"minor|medium|major","original":"必须逐字且唯一地出现在目标原文中，并限制在单一段落内，不得包含换行","replacement":"string","reason":"string"}],"fullRewrite":null}
+不要把建议直接应用到原文。不要为重复出现而无法唯一定位的原文生成可替换建议。没有问题时 suggestions 返回空数组。${repairInstruction}`;
 }
 
 function extractContent(response: unknown): string {
@@ -97,6 +105,12 @@ export async function requestSuggestions(
     try {
       const raw = await rawRequest(apiKey, model, promptFor(task, input, attempt === 1));
       const validated = parseValidated(extractContent(raw));
+      if (task === 'continue' && (!validated.fullRewrite?.trim() || validated.suggestions.length > 0)) {
+        throw new Error('续写响应必须只包含 fullRewrite，且 suggestions 为空。');
+      }
+      if (task !== 'continue' && validated.fullRewrite !== null) {
+        throw new Error('非续写任务不应返回 fullRewrite。');
+      }
       return { ...validated, suggestions: attachSuggestionContext(validated, context) };
     } catch (error) { lastError = error; }
   }
