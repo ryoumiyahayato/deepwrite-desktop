@@ -4,33 +4,41 @@ use tauri::Manager;
 use tauri_plugin_sql::{Migration, MigrationKind};
 
 fn migrations() -> Vec<Migration> {
-    vec![Migration {
-        version: 1,
-        description: "initialize local metadata database",
-        sql: r#"
-          CREATE TABLE IF NOT EXISTS recent_files (
-            path TEXT PRIMARY KEY, title TEXT NOT NULL, opened_at TEXT NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS versions (
-            id TEXT PRIMARY KEY, document_id TEXT NOT NULL, document_path TEXT,
-            created_at TEXT NOT NULL, reason TEXT NOT NULL, word_count INTEGER NOT NULL,
-            snapshot_json TEXT NOT NULL
-          );
-          CREATE INDEX IF NOT EXISTS idx_versions_document ON versions(document_id, created_at DESC);
-          CREATE TABLE IF NOT EXISTS ai_suggestions (
-            id TEXT PRIMARY KEY, document_id TEXT NOT NULL, revision INTEGER NOT NULL,
-            created_at TEXT NOT NULL, status TEXT NOT NULL, payload_json TEXT NOT NULL
-          );
-          CREATE TABLE IF NOT EXISTS document_history (
-            document_id TEXT PRIMARY KEY, path TEXT, title TEXT NOT NULL,
-            created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_revision INTEGER NOT NULL
-          );
-        "#,
-        kind: MigrationKind::Up,
-    }]
+    vec![
+        Migration {
+            version: 1,
+            description: "initialize local metadata database",
+            sql: r#"
+              CREATE TABLE IF NOT EXISTS recent_files (
+                path TEXT PRIMARY KEY, title TEXT NOT NULL, opened_at TEXT NOT NULL
+              );
+              CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+              );
+              CREATE TABLE IF NOT EXISTS versions (
+                id TEXT PRIMARY KEY, document_id TEXT NOT NULL, document_path TEXT,
+                created_at TEXT NOT NULL, reason TEXT NOT NULL, word_count INTEGER NOT NULL,
+                snapshot_json TEXT NOT NULL
+              );
+              CREATE INDEX IF NOT EXISTS idx_versions_document ON versions(document_id, created_at DESC);
+              CREATE TABLE IF NOT EXISTS ai_suggestions (
+                id TEXT PRIMARY KEY, document_id TEXT NOT NULL, revision INTEGER NOT NULL,
+                created_at TEXT NOT NULL, status TEXT NOT NULL, payload_json TEXT NOT NULL
+              );
+              CREATE TABLE IF NOT EXISTS document_history (
+                document_id TEXT PRIMARY KEY, path TEXT, title TEXT NOT NULL,
+                created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_revision INTEGER NOT NULL
+              );
+            "#,
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 2,
+            description: "remove legacy AI suggestion payloads containing document text",
+            sql: "DELETE FROM ai_suggestions;",
+            kind: MigrationKind::Up,
+        },
+    ]
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
