@@ -167,25 +167,33 @@ export default function App() {
 
   const manualSave = useCallback(async (saveAs = false): Promise<boolean> => {
     if (!editor) return false;
-    const current = { ...documentRef.current, content: editor.getJSON(), updatedAt: new Date().toISOString() };
+    const source = { ...documentRef.current, content: editor.getJSON(), updatedAt: new Date().toISOString() };
     setSaveState('saving');
     try {
-      const savedPath = await saveDwrite(current, pathRef.current, saveAs, settingsRef.current.general.defaultSaveDirectory);
-      if (!savedPath) { setSaveState('unsaved'); return false; }
-      const stillCurrent = documentRef.current.id === current.id && documentRef.current.revision === current.revision;
-      setPath(savedPath);
-      await addRecentFile(savedPath, current.title, settingsRef.current.general.recentFilesLimit);
+      const saved = await saveDwrite(source, pathRef.current, saveAs, settingsRef.current.general.defaultSaveDirectory);
+      if (!saved) { setSaveState('unsaved'); return false; }
+      const stillCurrent = documentRef.current.id === source.id && documentRef.current.revision === source.revision;
+      await addRecentFile(saved.path, saved.document.title, settingsRef.current.general.recentFilesLimit);
       await refreshRecent();
-      try { await snapshot('手动保存', current); }
-      catch (historyError) { setError(`文档已保存，但版本快照失败：${String(historyError)}`); }
       if (!stillCurrent) {
         setSaveState('unsaved');
         return false;
       }
-      setDocument(current); setSaveState('saved');
-      await clearRecovery(current.id);
+      pathRef.current = saved.path;
+      setPath(saved.path);
+      try { await snapshot('手动保存', saved.document); }
+      catch (historyError) { setError(`文档已保存，但版本快照失败：${String(historyError)}`); }
+      const identityChanged = saved.document.id !== source.id;
+      documentRef.current = saved.document;
+      setDocument(saved.document);
+      setSaveState('saved');
+      await clearRecovery(source.id);
+      if (identityChanged) {
+        setSuggestions([]); setContinuation(null); setAISummary(''); editor.commands.setAiSuggestionDecorations([]);
+      }
       return true;
     } catch (caught) {
+      try { await writeRecovery(source); } catch { /* keep the original save error */ }
       setSaveState('error'); setError(`保存失败：${String(caught)}`); return false;
     }
   }, [editor, refreshRecent, snapshot]);
