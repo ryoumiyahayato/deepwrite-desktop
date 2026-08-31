@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useEditor } from '@tiptap/react';
 import { FileText, PanelLeftClose, PanelRightClose } from 'lucide-react';
 import './App.css';
@@ -9,7 +10,7 @@ import { MenuBar, type MenuActions } from './components/MenuBar';
 import { OutlinePanel } from './components/OutlinePanel';
 import { StatusBar } from './components/StatusBar';
 import { Toolbar } from './components/Toolbar';
-import { createSuggestionContext, isSuggestionStale, stableHash, type AISuggestion } from './domain/ai';
+import { createSuggestionContext, isSuggestionStale, stableHash, type AISuggestion, type SuggestionContext } from './domain/ai';
 import { recentContext, shouldAutoAnalyze } from './domain/autoAnalysis';
 import {
   createDocument,
@@ -18,10 +19,13 @@ import {
   plainText,
   type DeepWriteDocument
 } from './domain/document';
+import { needsDocumentTransitionGuard, shouldWarnBeforeClose, type SaveState } from './domain/session';
 import { defaultSettings, type AppSettings } from './domain/settings';
 import { editorExtensions } from './editor/extensions';
+import { positionAtTextOffset, resolveSuggestionTargets } from './editor/suggestionTargets';
 import {
   addRecentFile,
+  clearVersions,
   createVersion,
   listRecentFiles,
   listVersions,
@@ -45,8 +49,8 @@ import {
 import { chooseOpenPath, fileNameFromPath, isTauri, readBinary } from './services/platform';
 import { deleteDeepSeekKey, hasDeepSeekKey, saveDeepSeekKey } from './services/secrets';
 
-type SaveState = 'saved' | 'unsaved' | 'saving' | 'error';
 type AIState = 'idle' | 'running' | 'error';
+interface GeneratedContinuation { text: string; context: SuggestionContext }
 
 function buildVersion(document: DeepWriteDocument, path: string | null, reason: string): VersionRecord {
   return {
@@ -72,6 +76,7 @@ export default function App() {
   const [aiState, setAIState] = useState<AIState>('idle');
   const [aiSummary, setAISummary] = useState('');
   const [suggestions, setSuggestions] = useState<AISuggestion[]>([]);
+  const [continuation, setContinuation] = useState<GeneratedContinuation | null>(null);
   const [recentFiles, setRecentFiles] = useState<RecentFile[]>([]);
   const [versions, setVersions] = useState<VersionRecord[]>([]);
   const [outlineCollapsed, setOutlineCollapsed] = useState(false);
@@ -87,11 +92,13 @@ export default function App() {
   const documentRef = useRef(document);
   const pathRef = useRef(path);
   const settingsRef = useRef(settings);
+  const saveStateRef = useRef(saveState);
   const lastAutoHash = useRef<string | null>(null);
 
   useEffect(() => { documentRef.current = document; }, [document]);
   useEffect(() => { pathRef.current = path; }, [path]);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
+  useEffect(() => { saveStateRef.current = saveState; }, [saveState]);
 
   const editor = useEditor({
     extensions: editorExtensions,
@@ -126,7 +133,7 @@ export default function App() {
   }, [settings.appearance.theme, settings.editor]);
 
   useEffect(() => {
-    window.document.title = `${document.title}${saveState === 'unsaved' ? ' •' : ''} — DeepWrite`;
+    window.document.title = `${document.title}${saveState === 'unsaved' || saveState === 'error' ? ' •' : ''} — DeepWrite`;
   }, [document.title, saveState]);
 
   useEffect(() => {
@@ -138,19 +145,80 @@ export default function App() {
         if (settingsRef.current.general.autosaveEnabled && pathRef.current) {
           setSaveState('saving');
           await saveDwrite(current, pathRef.current, false, settingsRef.current.general.defaultSaveDirectory);
-          setSaveState('saved');
-          await clearRecovery();
+          const stillCurrent = documentRef.current.id === current.id && documentRef.current.revision === current.revision;
+          if (stillCurrent) {
+            setSaveState('saved');
+            await clearRecovery(current.id);
+          } else {
+            setSaveState('unsaved');
+          }
         }
       } catch (caught) { setSaveState('error'); setError(`自动保存失败：${String(caught)}`); }
     }, 1500);
     return () => window.clearTimeout(timer);
   }, [document.revision]);
 
-  const snapshot = useCallback(async (reason: string) => {
-    const record = buildVersion(documentRef.current, pathRef.current, reason);
-    await createVersion(record);
+  const snapshot = useCallback(async (reason: string, source = documentRef.current) => {
+    const record = buildVersion(source, pathRef.current, reason);
+    await createVersion(record, settingsRef.current.general.versionHistoryLimit);
     return record;
   }, []);
+
+  const manualSave = useCallback(async (saveAs = false): Promise<boolean> => {
+    if (!editor) return false;
+    const current = { ...documentRef.current, content: editor.getJSON(), updatedAt: new Date().toISOString() };
+    setSaveState('saving');
+    try {
+      const savedPath = await saveDwrite(current, pathRef.current, saveAs, settingsRef.current.general.defaultSaveDirectory);
+      if (!savedPath) { setSaveState('unsaved'); return false; }
+      const stillCurrent = documentRef.current.id === current.id && documentRef.current.revision === current.revision;
+      setPath(savedPath);
+      await addRecentFile(savedPath, current.title, settingsRef.current.general.recentFilesLimit);
+      await refreshRecent();
+      try { await snapshot('手动保存', current); }
+      catch (historyError) { setError(`文档已保存，但版本快照失败：${String(historyError)}`); }
+      if (!stillCurrent) {
+        setSaveState('unsaved');
+        return false;
+      }
+      setDocument(current); setSaveState('saved');
+      await clearRecovery(current.id);
+      return true;
+    } catch (caught) {
+      setSaveState('error'); setError(`保存失败：${String(caught)}`); return false;
+    }
+  }, [editor, refreshRecent, snapshot]);
+
+  const prepareDocumentTransition = useCallback(async (): Promise<boolean> => {
+    if (!needsDocumentTransitionGuard(saveStateRef.current)) return true;
+    const saveFirst = window.confirm('当前文档有尚未确认写入磁盘的修改。\n\n确定：先保存并继续。\n取消：选择是否放弃这些修改。');
+    if (saveFirst) return manualSave(false);
+    const discard = window.confirm('确定要放弃当前未保存的修改吗？\n\n确定：放弃并继续。\n取消：返回当前文档。');
+    if (!discard) return false;
+    try { await clearRecovery(documentRef.current.id); }
+    catch (caught) { setError(`无法清理已放弃文档的恢复副本：${String(caught)}`); }
+    return true;
+  }, [manualSave]);
+
+  useEffect(() => {
+    if (isTauri()) {
+      let unlisten: (() => void) | undefined;
+      const appWindow = getCurrentWindow();
+      void appWindow.onCloseRequested(async (event) => {
+        if (!shouldWarnBeforeClose(saveStateRef.current)) return;
+        event.preventDefault();
+        if (await prepareDocumentTransition()) await appWindow.destroy();
+      }).then((dispose) => { unlisten = dispose; });
+      return () => { unlisten?.(); };
+    }
+    const beforeUnload = (event: BeforeUnloadEvent) => {
+      if (!shouldWarnBeforeClose(saveStateRef.current)) return;
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', beforeUnload);
+    return () => window.removeEventListener('beforeunload', beforeUnload);
+  }, [prepareDocumentTransition]);
 
   const applyLoaded = useCallback(async (loaded: ImportedContent) => {
     if (!editor) return;
@@ -161,50 +229,37 @@ export default function App() {
         setDocument(loaded.document); setPath(loaded.path); setSaveState('saved');
         await addRecentFile(loaded.path, loaded.document.title, settingsRef.current.general.recentFilesLimit);
       } else {
-        await snapshot('重要导入操作前');
         editor.commands.setContent(loaded.html, { emitUpdate: false });
         const imported = { ...createDocument(loaded.title), content: editor.getJSON(), revision: 1, metadata: { importedFrom: loaded.sourcePath, importedAt: new Date().toISOString() } };
         setDocument(imported); setPath(null); setSaveState('unsaved');
         if (loaded.warnings.length) setError(`导入完成，含 ${loaded.warnings.length} 条兼容性提示：${loaded.warnings[0]}`);
       }
-      setSuggestions([]); setAISummary(''); editor.commands.setAiSuggestionDecorations([]);
+      setSuggestions([]); setContinuation(null); setAISummary(''); editor.commands.setAiSuggestionDecorations([]);
       await refreshRecent();
     } finally { loadingRef.current = false; }
-  }, [editor, refreshRecent, snapshot]);
+  }, [editor, refreshRecent]);
 
   const openFile = useCallback(async () => {
+    if (!(await prepareDocumentTransition())) return;
     try { const loaded = await chooseAndOpenDocument(); if (loaded) await applyLoaded(loaded); }
     catch (caught) { setError(`打开失败：${String(caught)}`); }
-  }, [applyLoaded]);
+  }, [applyLoaded, prepareDocumentTransition]);
 
   const openRecent = useCallback(async (recentPath: string) => {
+    if (!(await prepareDocumentTransition())) return;
     try { await applyLoaded(await openDocumentAtPath(recentPath)); }
     catch (caught) { setError(`无法打开最近文件：${String(caught)}`); }
-  }, [applyLoaded]);
+  }, [applyLoaded, prepareDocumentTransition]);
 
-  const newDocument = useCallback(() => {
-    if (!editor) return;
+  const newDocument = useCallback(async () => {
+    if (!editor || !(await prepareDocumentTransition())) return;
     const created = createDocument();
     loadingRef.current = true;
     editor.commands.setContent(created.content, { emitUpdate: false });
     loadingRef.current = false;
-    setDocument(created); setPath(null); setSaveState('unsaved'); setSuggestions([]); setAISummary('');
+    setDocument(created); setPath(null); setSaveState('unsaved'); setSuggestions([]); setContinuation(null); setAISummary('');
     editor.commands.setAiSuggestionDecorations([]);
-  }, [editor]);
-
-  const manualSave = useCallback(async (saveAs = false) => {
-    if (!editor) return;
-    setSaveState('saving');
-    const current = { ...documentRef.current, content: editor.getJSON(), updatedAt: new Date().toISOString() };
-    try {
-      await snapshot('手动保存');
-      const savedPath = await saveDwrite(current, pathRef.current, saveAs, settingsRef.current.general.defaultSaveDirectory);
-      if (!savedPath) { setSaveState('unsaved'); return; }
-      setPath(savedPath); setDocument(current); setSaveState('saved');
-      await Promise.all([clearRecovery(), addRecentFile(savedPath, current.title, settingsRef.current.general.recentFilesLimit)]);
-      await refreshRecent();
-    } catch (caught) { setSaveState('error'); setError(`保存失败：${String(caught)}`); }
-  }, [editor, refreshRecent, snapshot]);
+  }, [editor, prepareDocumentTransition]);
 
   const runExport = useCallback(async (format: 'docx' | 'txt' | 'md' | 'html') => {
     if (!editor) return;
@@ -230,10 +285,10 @@ export default function App() {
     let selected = forced?.text ?? editor.state.doc.textBetween(from, to, '\n');
     if (!selected.trim()) {
       if (task !== 'continue') { setError('请先选择要分析的文字。'); return; }
-      to = editor.state.doc.content.size; from = Math.max(1, to - 2000); selected = editor.state.doc.textBetween(from, to, '\n');
+      to = editor.state.doc.content.size; from = Math.max(0, to - 2000); selected = editor.state.doc.textBetween(from, to, '\n');
     }
     const max = settingsRef.current.ai.maxContextCharacters;
-    if (selected.length > max) { selected = selected.slice(0, max); to = from + selected.length; }
+    if (selected.length > max) selected = selected.slice(0, max);
     const customInstruction = task === 'custom' ? window.prompt('请输入自定义写作要求') ?? '' : undefined;
     if (task === 'custom' && !customInstruction?.trim()) return;
     const context = createSuggestionContext(documentRef.current.id, documentRef.current.revision, from, to, selected);
@@ -241,11 +296,24 @@ export default function App() {
     const after = editor.state.doc.textBetween(to, Math.min(editor.state.doc.content.size, to + Math.floor(max / 3)), '\n');
     const chapterSummary = extractOutline(documentRef.current.content).slice(-3).map((item) => item.text).join(' › ');
     setAIState('running'); setAICollapsed(false);
+    if (task !== 'continue') setContinuation(null);
     try {
       const response = await requestSuggestions(task, { selected, before, after, chapterSummary, authorRules: settingsRef.current.ai.authorRules, customInstruction }, settingsRef.current, context);
-      setAISummary(response.summary); setSuggestions(response.suggestions); setAIState('idle');
-      editor.commands.setAiSuggestionDecorations(response.suggestions);
-      await recordSuggestions(documentRef.current.id, documentRef.current.revision, response.suggestions);
+      if (documentRef.current.id !== context.documentId) { setAIState('idle'); return; }
+      setAISummary(response.summary);
+      if (task === 'continue') {
+        const generated = response.fullRewrite?.trim();
+        if (!generated) throw new Error('DeepSeek 没有返回可用的续写正文。');
+        setSuggestions([]); editor.commands.setAiSuggestionDecorations([]);
+        setContinuation({ text: generated, context });
+        if (documentRef.current.revision !== context.documentRevision) setAISummary(`${response.summary}（生成期间原文已变化；此续写只能复制，不能直接插入。）`);
+      } else {
+        const resolved = resolveSuggestionTargets(response.suggestions, editor.state.doc, documentRef.current.id, documentRef.current.revision);
+        setSuggestions(resolved); editor.commands.setAiSuggestionDecorations(resolved);
+        try { await recordSuggestions(context.documentId, context.documentRevision, resolved); }
+        catch (historyError) { setError(`AI 建议已生成，但本地建议元数据记录失败：${String(historyError)}`); }
+      }
+      setAIState('idle');
     } catch (caught) { setAIState('error'); setError(caught instanceof Error ? caught.message : String(caught)); }
   }, [editor]);
 
@@ -253,11 +321,14 @@ export default function App() {
     const minutes = settings.ai.idleAnalysisMinutes;
     if (!editor || !shouldAutoAnalyze(minutes, document.revision > 0, editor.getText(), lastAutoHash.current)) return;
     const timer = window.setTimeout(() => {
-      const text = recentContext(editor.getText({ blockSeparator: '\n' }), Math.min(settings.ai.maxContextCharacters, 4000));
+      const fullText = editor.state.doc.textBetween(0, editor.state.doc.content.size, '\n');
+      const text = recentContext(fullText, Math.min(settings.ai.maxContextCharacters, 4000));
       const hash = stableHash(text);
       if (hash === lastAutoHash.current) return;
       lastAutoHash.current = hash;
-      const to = editor.state.doc.content.size; const from = Math.max(1, to - text.length);
+      const to = editor.state.doc.content.size;
+      const offset = Math.max(0, fullText.lastIndexOf(text));
+      const from = positionAtTextOffset(editor.state.doc, 0, to, offset) ?? Math.max(0, to - text.length);
       void performAI('auto', { from, to, text });
     }, minutes * 60_000);
     return () => window.clearTimeout(timer);
@@ -271,30 +342,49 @@ export default function App() {
     if (!editor) return;
     const suggestion = suggestions.find((item) => item.id === id);
     if (!suggestion || suggestion.status !== 'pending' || suggestion.targetFrom === null || suggestion.targetTo === null) return;
-    const current = editor.state.doc.textBetween(suggestion.targetFrom, suggestion.targetTo, '');
-    if (isSuggestionStale(suggestion, current, documentRef.current.id)) {
+    const current = editor.state.doc.textBetween(suggestion.targetFrom, suggestion.targetTo, '\n');
+    if (isSuggestionStale(suggestion, current, documentRef.current.id, documentRef.current.revision)) {
       syncSuggestions(suggestions.map((item) => item.id === id ? { ...item, status: 'stale' } : item)); return;
     }
-    try { await snapshot('执行 AI 替换前'); editor.chain().focus().insertContentAt({ from: suggestion.targetFrom, to: suggestion.targetTo }, suggestion.replacement).run(); syncSuggestions(suggestions.map((item) => item.id === id ? { ...item, status: 'accepted' } : item)); }
-    catch (caught) { setError(`接受建议失败：${String(caught)}`); }
+    try {
+      await snapshot('执行 AI 替换前');
+      editor.chain().focus().insertContentAt({ from: suggestion.targetFrom, to: suggestion.targetTo }, suggestion.replacement).run();
+      syncSuggestions(suggestions.map((item) => item.id === id ? { ...item, status: 'accepted' } : item.status === 'pending' ? { ...item, status: 'stale' } : item));
+    } catch (caught) { setError(`接受建议失败：${String(caught)}`); }
   }, [editor, snapshot, suggestions, syncSuggestions]);
 
   const acceptAll = useCallback(async () => {
     if (!editor) return;
     const pending = suggestions.filter((item) => item.status === 'pending' && item.targetFrom !== null && item.targetTo !== null).sort((a, b) => (b.targetFrom ?? 0) - (a.targetFrom ?? 0));
     if (!pending.length) return;
+    const originalRevision = documentRef.current.revision;
     await snapshot('批量接受 AI 修改前');
     const statuses = new Map<string, AISuggestion['status']>();
     for (const suggestion of pending) {
-      const current = editor.state.doc.textBetween(suggestion.targetFrom!, suggestion.targetTo!, '');
-      if (isSuggestionStale(suggestion, current, documentRef.current.id)) statuses.set(suggestion.id, 'stale');
+      const current = editor.state.doc.textBetween(suggestion.targetFrom!, suggestion.targetTo!, '\n');
+      if (isSuggestionStale(suggestion, current, documentRef.current.id, originalRevision)) statuses.set(suggestion.id, 'stale');
       else { editor.chain().focus().insertContentAt({ from: suggestion.targetFrom!, to: suggestion.targetTo! }, suggestion.replacement).run(); statuses.set(suggestion.id, 'accepted'); }
     }
-    syncSuggestions(suggestions.map((item) => statuses.has(item.id) ? { ...item, status: statuses.get(item.id)! } : item));
+    syncSuggestions(suggestions.map((item) => statuses.has(item.id) ? { ...item, status: statuses.get(item.id)! } : item.status === 'pending' ? { ...item, status: 'stale' } : item));
   }, [editor, snapshot, suggestions, syncSuggestions]);
 
   const rejectSuggestion = useCallback((id: string) => syncSuggestions(suggestions.map((item) => item.id === id ? { ...item, status: 'rejected' } : item)), [suggestions, syncSuggestions]);
   const rejectAll = useCallback(() => syncSuggestions(suggestions.map((item) => item.status === 'pending' ? { ...item, status: 'rejected' } : item)), [suggestions, syncSuggestions]);
+
+  const insertContinuation = useCallback(async () => {
+    if (!editor || !continuation) return;
+    if (continuation.context.documentId !== documentRef.current.id || continuation.context.documentRevision !== documentRef.current.revision) {
+      setError('生成续写后原文已经变化。为避免把旧上下文生成的内容插入新版本，请复制需要的文字或重新生成。');
+      return;
+    }
+    try {
+      await snapshot('插入 AI 续写前');
+      const paragraphs = continuation.text.split(/\n+/).map((text) => text.trim()).filter(Boolean).map((text) => ({ type: 'paragraph', content: [{ type: 'text', text }] }));
+      if (!paragraphs.length) return;
+      editor.chain().focus('end').insertContent(paragraphs).run();
+      setContinuation(null);
+    } catch (caught) { setError(`插入续写失败：${String(caught)}`); }
+  }, [continuation, editor, snapshot]);
 
   const findText = useCallback((query: string) => {
     if (!editor || !query) return;
@@ -332,18 +422,24 @@ export default function App() {
     catch (caught) { setError(`无法加载版本历史：${String(caught)}`); }
   }, []);
 
+  const clearHistory = useCallback(async () => {
+    if (!window.confirm('确定清除当前文档保存在本机 SQLite 中的全部版本快照吗？此操作不可撤销。')) return;
+    try { await clearVersions(documentRef.current.id); setVersions([]); }
+    catch (caught) { setError(`清除版本历史失败：${String(caught)}`); }
+  }, []);
+
   const restoreVersion = useCallback(async (version: VersionRecord) => {
     if (!editor) return;
     await snapshot('恢复旧版本前'); loadingRef.current = true;
     editor.commands.setContent(version.snapshot.content, { emitUpdate: false }); loadingRef.current = false;
     setDocument({ ...version.snapshot, updatedAt: new Date().toISOString(), revision: documentRef.current.revision + 1 });
-    setSaveState('unsaved'); setHistoryOpen(false);
+    setSaveState('unsaved'); setHistoryOpen(false); setSuggestions([]); setContinuation(null); editor.commands.setAiSuggestionDecorations([]);
   }, [editor, snapshot]);
 
   const saveAppSettings = useCallback(async (next: AppSettings) => { await saveSettings(next); setSettingsState(next); await refreshRecent(next.general.recentFilesLimit); }, [refreshRecent]);
 
   const menuActions = useMemo<MenuActions>(() => ({
-    newDocument, open: openFile, save: () => void manualSave(false), saveAs: () => void manualSave(true),
+    newDocument: () => void newDocument(), open: () => void openFile(), save: () => void manualSave(false), saveAs: () => void manualSave(true),
     exportDocx: () => void runExport('docx'), exportTxt: () => void runExport('txt'), exportMd: () => void runExport('md'), exportHtml: () => void runExport('html'),
     find: () => setFindMode('find'), replace: () => setFindMode('replace'), settings: () => { void hasDeepSeekKey().then(setStoredKey); setSettingsOpen(true); },
     history: () => void openHistory(), toggleOutline: () => setOutlineCollapsed((value) => !value), toggleAI: () => setAICollapsed((value) => !value), print: () => window.print()
@@ -353,7 +449,7 @@ export default function App() {
     const onKey = (event: KeyboardEvent) => {
       if (!event.ctrlKey) return;
       const key = event.key.toLowerCase();
-      if (key === 'n') { event.preventDefault(); newDocument(); }
+      if (key === 'n') { event.preventDefault(); void newDocument(); }
       if (key === 'o') { event.preventDefault(); void openFile(); }
       if (key === 's') { event.preventDefault(); void manualSave(event.shiftKey); }
       if (key === 'f') { event.preventDefault(); setFindMode('find'); }
@@ -373,13 +469,13 @@ export default function App() {
     <div className="workspace-grid">
       <OutlinePanel items={outline} collapsed={outlineCollapsed} onToggle={() => setOutlineCollapsed((value) => !value)} onNavigate={(position) => editor?.chain().focus().setTextSelection(Math.max(1, position)).run()} recentFiles={recentFiles} onOpenRecent={(recentPath) => void openRecent(recentPath)} onHistory={() => void openHistory()} onSettings={menuActions.settings} />
       <EditorCanvas editor={editor} zoom={zoom} />
-      <AIPanel collapsed={aiCollapsed} onToggle={() => setAICollapsed((value) => !value)} status={aiState} summary={aiSummary} suggestions={suggestions} onRun={(task) => void performAI(task)} onAccept={(id) => void acceptSuggestion(id)} onReject={rejectSuggestion} onAcceptAll={() => void acceptAll()} onRejectAll={rejectAll} />
+      <AIPanel collapsed={aiCollapsed} onToggle={() => setAICollapsed((value) => !value)} status={aiState} summary={aiSummary} suggestions={suggestions} generatedText={continuation?.text ?? null} onRun={(task) => void performAI(task)} onAccept={(id) => void acceptSuggestion(id)} onReject={rejectSuggestion} onAcceptAll={() => void acceptAll()} onRejectAll={rejectAll} onInsertGenerated={() => void insertContinuation()} onDiscardGenerated={() => setContinuation(null)} />
     </div>
     <StatusBar stats={stats} saveState={saveState} aiState={aiState} zoom={zoom} onZoom={setZoom} />
     {settingsOpen ? <SettingsDialog initial={settings} hasKey={storedKey} onClose={() => setSettingsOpen(false)} onSave={saveAppSettings} onSaveKey={async (key) => { await saveDeepSeekKey(key); setStoredKey(true); }} onDeleteKey={async () => { await deleteDeepSeekKey(); setStoredKey(false); }} onTest={testDeepSeekConnection} /> : null}
     {findMode ? <FindReplaceDialog replaceMode={findMode === 'replace'} onClose={() => setFindMode(null)} onFind={findText} onReplace={replaceText} onReplaceAll={replaceAll} /> : null}
-    {historyOpen ? <HistoryDialog versions={versions} onClose={() => setHistoryOpen(false)} onRestore={(version) => void restoreVersion(version)} /> : null}
-    {recovery ? <RecoveryDialog document={recovery} onRestore={() => { if (editor) { loadingRef.current = true; editor.commands.setContent(recovery.content, { emitUpdate: false }); loadingRef.current = false; } setDocument(recovery); setPath(null); setSaveState('unsaved'); setRecovery(null); }} onDiscard={() => { void clearRecovery(); setRecovery(null); }} /> : null}
+    {historyOpen ? <HistoryDialog versions={versions} onClose={() => setHistoryOpen(false)} onRestore={(version) => void restoreVersion(version)} onClear={() => void clearHistory()} /> : null}
+    {recovery ? <RecoveryDialog document={recovery} onRestore={() => { if (editor) { loadingRef.current = true; editor.commands.setContent(recovery.content, { emitUpdate: false }); loadingRef.current = false; editor.commands.setAiSuggestionDecorations([]); } setDocument(recovery); setPath(null); setSaveState('unsaved'); setSuggestions([]); setContinuation(null); setAISummary(''); setRecovery(null); }} onDiscard={() => { const discarded = recovery; void clearRecovery(discarded.id).then(() => readRecovery()).then(setRecovery).catch((caught) => { setRecovery(null); setError(`清理恢复内容失败：${String(caught)}`); }); }} /> : null}
     {error ? <ErrorNotice message={error} onClose={() => setError('')} /> : null}
   </div>;
 }
