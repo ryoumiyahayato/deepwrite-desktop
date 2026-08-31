@@ -85,7 +85,7 @@ export async function exportDocument(
 }
 
 export async function writeRecovery(document: DeepWriteDocument): Promise<void> {
-  await invokeCommand('write_recovery', { contents: serializeDocument(document) });
+  await invokeCommand('write_recovery', { documentId: document.id, contents: serializeDocument(document) });
 }
 
 export async function readRecovery(): Promise<DeepWriteDocument | null> {
@@ -94,8 +94,8 @@ export async function readRecovery(): Promise<DeepWriteDocument | null> {
   return parseDocument(contents);
 }
 
-export async function clearRecovery(): Promise<void> {
-  await invokeCommand('clear_recovery');
+export async function clearRecovery(documentId: string): Promise<void> {
+  await invokeCommand('clear_recovery', { documentId });
 }
 
 export function importedHtmlDocument(title: string, content: JSONContent): DeepWriteDocument {
