@@ -32,6 +32,8 @@ export interface SuggestionContext {
 export interface AISuggestion extends z.infer<typeof aiSuggestionSchema> {
   status: SuggestionStatus;
   context: SuggestionContext;
+  relativeFrom: number | null;
+  relativeTo: number | null;
   targetFrom: number | null;
   targetTo: number | null;
 }
@@ -59,24 +61,40 @@ export function createSuggestionContext(
     selectionTo,
     originalText,
     originalHash: stableHash(originalText),
-    blockIdentity: `${documentId}:${selectionFrom}-${selectionTo}`
+    blockIdentity: `${documentId}:${documentRevision}:${selectionFrom}-${selectionTo}`
   };
 }
 
-export function isSuggestionStale(suggestion: AISuggestion, currentTargetText: string, currentDocumentId: string): boolean {
+export function isSuggestionStale(
+  suggestion: AISuggestion,
+  currentTargetText: string,
+  currentDocumentId: string,
+  currentDocumentRevision: number
+): boolean {
   if (suggestion.context.documentId !== currentDocumentId) return true;
-  return stableHash(currentTargetText) !== stableHash(suggestion.original);
+  if (suggestion.context.documentRevision !== currentDocumentRevision) return true;
+  return currentTargetText !== suggestion.original;
+}
+
+function uniqueOffset(haystack: string, needle: string): number | null {
+  if (!needle || needle.includes('\n')) return null;
+  const first = haystack.indexOf(needle);
+  if (first < 0) return null;
+  const second = haystack.indexOf(needle, first + Math.max(1, needle.length));
+  return second < 0 ? first : null;
 }
 
 export function attachSuggestionContext(response: AIResponse, context: SuggestionContext): AISuggestion[] {
   return response.suggestions.map((suggestion) => {
-    const offset = context.originalText.indexOf(suggestion.original);
+    const offset = uniqueOffset(context.originalText, suggestion.original);
     return {
       ...suggestion,
       status: 'pending',
       context,
-      targetFrom: offset >= 0 ? context.selectionFrom + offset : null,
-      targetTo: offset >= 0 ? context.selectionFrom + offset + suggestion.original.length : null
+      relativeFrom: offset,
+      relativeTo: offset === null ? null : offset + suggestion.original.length,
+      targetFrom: null,
+      targetTo: null
     };
   });
 }
