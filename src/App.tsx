@@ -50,6 +50,7 @@ import { chooseOpenPath, fileNameFromPath, isTauri, readBinary } from './service
 import { deleteDeepSeekKey, hasDeepSeekKey, saveDeepSeekKey } from './services/secrets';
 
 type AIState = 'idle' | 'running' | 'error';
+type TransitionDecision = 'proceed' | 'discard' | 'cancel';
 interface GeneratedContinuation { text: string; context: SuggestionContext }
 
 function buildVersion(document: DeepWriteDocument, path: string | null, reason: string): VersionRecord {
@@ -189,16 +190,19 @@ export default function App() {
     }
   }, [editor, refreshRecent, snapshot]);
 
-  const prepareDocumentTransition = useCallback(async (): Promise<boolean> => {
-    if (!needsDocumentTransitionGuard(saveStateRef.current)) return true;
+  const prepareDocumentTransition = useCallback(async (): Promise<TransitionDecision> => {
+    if (!needsDocumentTransitionGuard(saveStateRef.current)) return 'proceed';
     const saveFirst = window.confirm('当前文档有尚未确认写入磁盘的修改。\n\n确定：先保存并继续。\n取消：选择是否放弃这些修改。');
-    if (saveFirst) return manualSave(false);
+    if (saveFirst) return await manualSave(false) ? 'proceed' : 'cancel';
     const discard = window.confirm('确定要放弃当前未保存的修改吗？\n\n确定：放弃并继续。\n取消：返回当前文档。');
-    if (!discard) return false;
-    try { await clearRecovery(documentRef.current.id); }
-    catch (caught) { setError(`无法清理已放弃文档的恢复副本：${String(caught)}`); }
-    return true;
+    return discard ? 'discard' : 'cancel';
   }, [manualSave]);
+
+  const commitDiscard = useCallback(async (decision: TransitionDecision, documentId: string) => {
+    if (decision !== 'discard') return;
+    try { await clearRecovery(documentId); }
+    catch (caught) { setError(`已切换文档，但无法清理被放弃文档的恢复副本：${String(caught)}`); }
+  }, []);
 
   useEffect(() => {
     if (isTauri()) {
@@ -207,7 +211,13 @@ export default function App() {
       void appWindow.onCloseRequested(async (event) => {
         if (!shouldWarnBeforeClose(saveStateRef.current)) return;
         event.preventDefault();
-        if (await prepareDocumentTransition()) await appWindow.destroy();
+        const decision = await prepareDocumentTransition();
+        if (decision === 'cancel') return;
+        if (decision === 'discard') {
+          try { await clearRecovery(documentRef.current.id); }
+          catch (caught) { setError(`无法清理被放弃文档的恢复副本：${String(caught)}`); }
+        }
+        await appWindow.destroy();
       }).then((dispose) => { unlisten = dispose; });
       return () => { unlisten?.(); };
     }
@@ -240,26 +250,41 @@ export default function App() {
   }, [editor, refreshRecent]);
 
   const openFile = useCallback(async () => {
-    if (!(await prepareDocumentTransition())) return;
-    try { const loaded = await chooseAndOpenDocument(); if (loaded) await applyLoaded(loaded); }
-    catch (caught) { setError(`打开失败：${String(caught)}`); }
-  }, [applyLoaded, prepareDocumentTransition]);
+    try {
+      const loaded = await chooseAndOpenDocument();
+      if (!loaded) return;
+      const decision = await prepareDocumentTransition();
+      if (decision === 'cancel') return;
+      const previousDocumentId = documentRef.current.id;
+      await applyLoaded(loaded);
+      await commitDiscard(decision, previousDocumentId);
+    } catch (caught) { setError(`打开失败：${String(caught)}`); }
+  }, [applyLoaded, commitDiscard, prepareDocumentTransition]);
 
   const openRecent = useCallback(async (recentPath: string) => {
-    if (!(await prepareDocumentTransition())) return;
-    try { await applyLoaded(await openDocumentAtPath(recentPath)); }
-    catch (caught) { setError(`无法打开最近文件：${String(caught)}`); }
-  }, [applyLoaded, prepareDocumentTransition]);
+    try {
+      const loaded = await openDocumentAtPath(recentPath);
+      const decision = await prepareDocumentTransition();
+      if (decision === 'cancel') return;
+      const previousDocumentId = documentRef.current.id;
+      await applyLoaded(loaded);
+      await commitDiscard(decision, previousDocumentId);
+    } catch (caught) { setError(`无法打开最近文件：${String(caught)}`); }
+  }, [applyLoaded, commitDiscard, prepareDocumentTransition]);
 
   const newDocument = useCallback(async () => {
-    if (!editor || !(await prepareDocumentTransition())) return;
+    if (!editor) return;
+    const decision = await prepareDocumentTransition();
+    if (decision === 'cancel') return;
+    const previousDocumentId = documentRef.current.id;
     const created = createDocument();
     loadingRef.current = true;
     editor.commands.setContent(created.content, { emitUpdate: false });
     loadingRef.current = false;
     setDocument(created); setPath(null); setSaveState('unsaved'); setSuggestions([]); setContinuation(null); setAISummary('');
     editor.commands.setAiSuggestionDecorations([]);
-  }, [editor, prepareDocumentTransition]);
+    await commitDiscard(decision, previousDocumentId);
+  }, [commitDiscard, editor, prepareDocumentTransition]);
 
   const runExport = useCallback(async (format: 'docx' | 'txt' | 'md' | 'html') => {
     if (!editor) return;
@@ -281,19 +306,21 @@ export default function App() {
   const performAI = useCallback(async (task: AITask, forced?: { from: number; to: number; text: string }) => {
     if (!editor) return;
     const { from: selectedFrom, to: selectedTo } = editor.state.selection;
-    let from = forced?.from ?? selectedFrom; let to = forced?.to ?? selectedTo;
+    let from = forced?.from ?? selectedFrom; const to = forced?.to ?? selectedTo;
     let selected = forced?.text ?? editor.state.doc.textBetween(from, to, '\n');
     if (!selected.trim()) {
       if (task !== 'continue') { setError('请先选择要分析的文字。'); return; }
-      to = editor.state.doc.content.size; from = Math.max(0, to - 2000); selected = editor.state.doc.textBetween(from, to, '\n');
+      const end = editor.state.doc.content.size;
+      from = Math.max(0, end - 2000); selected = editor.state.doc.textBetween(from, end, '\n');
     }
+    const actualTo = task === 'continue' && !forced?.text && selectedFrom === selectedTo ? editor.state.doc.content.size : to;
     const max = settingsRef.current.ai.maxContextCharacters;
     if (selected.length > max) selected = selected.slice(0, max);
     const customInstruction = task === 'custom' ? window.prompt('请输入自定义写作要求') ?? '' : undefined;
     if (task === 'custom' && !customInstruction?.trim()) return;
-    const context = createSuggestionContext(documentRef.current.id, documentRef.current.revision, from, to, selected);
+    const context = createSuggestionContext(documentRef.current.id, documentRef.current.revision, from, actualTo, selected);
     const before = editor.state.doc.textBetween(Math.max(0, from - Math.floor(max / 3)), from, '\n');
-    const after = editor.state.doc.textBetween(to, Math.min(editor.state.doc.content.size, to + Math.floor(max / 3)), '\n');
+    const after = editor.state.doc.textBetween(actualTo, Math.min(editor.state.doc.content.size, actualTo + Math.floor(max / 3)), '\n');
     const chapterSummary = extractOutline(documentRef.current.content).slice(-3).map((item) => item.text).join(' › ');
     setAIState('running'); setAICollapsed(false);
     if (task !== 'continue') setContinuation(null);
@@ -379,7 +406,7 @@ export default function App() {
     }
     try {
       await snapshot('插入 AI 续写前');
-      const paragraphs = continuation.text.split(/\n+/).map((text) => text.trim()).filter(Boolean).map((text) => ({ type: 'paragraph', content: [{ type: 'text', text }] }));
+      const paragraphs = continuation.text.split(/\n+/).map((value) => value.trim()).filter(Boolean).map((value) => ({ type: 'paragraph', content: [{ type: 'text', text: value }] }));
       if (!paragraphs.length) return;
       editor.chain().focus('end').insertContent(paragraphs).run();
       setContinuation(null);
@@ -388,18 +415,28 @@ export default function App() {
 
   const findText = useCallback((query: string) => {
     if (!editor || !query) return;
+    const currentDocument = editor.state.doc;
+    const end = currentDocument.content.size;
     const start = editor.state.selection.to;
-    const rest = editor.state.doc.textBetween(start, editor.state.doc.content.size, '\n');
-    let offset = rest.indexOf(query); let from = start + offset;
-    if (offset < 0) { const all = editor.getText({ blockSeparator: '\n' }); offset = all.indexOf(query); from = 1 + offset; }
-    if (offset >= 0) editor.chain().focus().setTextSelection({ from, to: from + query.length }).run();
-    else setError(`未找到“${query}”`);
+    const selectMatch = (rangeFrom: number, rangeTo: number, text: string): boolean => {
+      const offset = text.indexOf(query);
+      if (offset < 0) return false;
+      const from = positionAtTextOffset(currentDocument, rangeFrom, rangeTo, offset);
+      const to = positionAtTextOffset(currentDocument, rangeFrom, rangeTo, offset + query.length);
+      if (from === null || to === null || from > to) return false;
+      editor.chain().focus().setTextSelection({ from, to }).run();
+      return true;
+    };
+    const rest = currentDocument.textBetween(start, end, '\n');
+    if (selectMatch(start, end, rest)) return;
+    const all = currentDocument.textBetween(0, end, '\n');
+    if (!selectMatch(0, end, all)) setError(`未找到“${query}”`);
   }, [editor]);
 
   const replaceText = useCallback((query: string, replacement: string) => {
     if (!editor) return;
     const { from, to } = editor.state.selection;
-    if (editor.state.doc.textBetween(from, to, '') === query) editor.chain().focus().insertContentAt({ from, to }, replacement).run();
+    if (editor.state.doc.textBetween(from, to, '\n') === query) editor.chain().focus().insertContentAt({ from, to }, replacement).run();
     findText(query);
   }, [editor, findText]);
 
