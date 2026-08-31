@@ -19,7 +19,7 @@ describe('AI response validation and concurrency protection', () => {
     const context = createSuggestionContext('doc-1', 7, 10, 16, '这里非常的安静');
     const suggestion = attachSuggestionContext(aiResponseSchema.parse(validResponse), context)[0];
     expect(suggestion.relativeFrom).toBe(2);
-    expect(suggestion.relativeTo).toBe(8);
+    expect(suggestion.relativeTo).toBe(7);
     expect(isSuggestionStale(suggestion, '非常的安静', 'doc-1', 7)).toBe(false);
     expect(isSuggestionStale(suggestion, '已经被用户改写', 'doc-1', 7)).toBe(true);
     expect(isSuggestionStale(suggestion, '非常的安静', 'doc-2', 7)).toBe(true);
