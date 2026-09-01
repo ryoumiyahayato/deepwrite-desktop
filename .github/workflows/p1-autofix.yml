@@ -1,0 +1,72 @@
+name: One-shot P1 autofix
+
+on:
+  push:
+    branches:
+      - fix/foundational-contracts-20260831
+    paths:
+      - scripts/p1_autofix.py
+      - .github/workflows/p1-autofix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/foundational-contracts-20260831
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply asserted P1 patch
+        run: python scripts/p1_autofix.py
+      - name: Preserve legacy recovery visibility
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('src-tauri/src/commands.rs')
+          text = path.read_text(encoding='utf-8')
+          old = '''            if recovery_document_id(&contents).is_some() {
+                          if let Some(key) = recovery_key_from_path(&path) {
+                              return Ok(Some(RecoveryPayload { key, contents }));
+                          }
+                      }
+          '''
+          # The generated code uses normal Rust indentation. Normalize the exact
+          # snippet explicitly rather than using a broad regex.
+          old = '''            if recovery_document_id(&contents).is_some() {
+                if let Some(key) = recovery_key_from_path(&path) {
+                    return Ok(Some(RecoveryPayload { key, contents }));
+                }
+            }
+          '''
+          new = '''            if let Some(document_id) = recovery_document_id(&contents) {
+                let key = recovery_key_from_path(&path).or_else(|| {
+                    (path.file_name().and_then(|value| value.to_str()) == Some("pending.dwrite"))
+                        .then_some(document_id)
+                });
+                if let Some(key) = key {
+                    return Ok(Some(RecoveryPayload { key, contents }));
+                }
+            }
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'legacy recovery patch baseline mismatch: {text.count(old)} matches')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+          PY
+      - name: Validate patch whitespace
+        run: git diff --check
+      - name: Commit repaired contracts and remove one-shot tooling
+        shell: bash
+        run: |
+          git rm scripts/p1_autofix.py .github/workflows/p1-autofix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "fix: resolve known P1 writing contracts"
+          git push origin HEAD:fix/foundational-contracts-20260831
