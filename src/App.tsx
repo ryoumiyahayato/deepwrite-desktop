@@ -336,14 +336,12 @@ export default function App() {
     const max = settingsRef.current.ai.maxContextCharacters;
     let from = forced?.from ?? selectedFrom;
     let actualTo = forced?.to ?? selectedTo;
-    let selected = forced?.text ?? editor.state.doc.textBetween(from, actualTo, '
-');
+    let selected = forced?.text ?? editor.state.doc.textBetween(from, actualTo, '\n');
 
     if (!forced && task === 'continue' && selectedFrom === selectedTo) {
       actualTo = selectedTo;
       from = Math.max(0, actualTo - Math.min(max, 4000));
-      selected = editor.state.doc.textBetween(from, actualTo, '
-');
+      selected = editor.state.doc.textBetween(from, actualTo, '\n');
     }
     if (!selected.trim() && task !== 'continue') { setError('请先选择要分析的文字。'); return; }
 
@@ -353,14 +351,11 @@ export default function App() {
     if (task === 'custom' && !customInstruction?.trim()) return;
     const context = createSuggestionContext(documentRef.current.id, documentRef.current.revision, from, actualTo, selected);
     const flankLimit = Math.max(400, Math.floor(max * 0.15));
-    const before = editor.state.doc.textBetween(Math.max(0, from - flankLimit), from, '
-');
-    const after = editor.state.doc.textBetween(actualTo, Math.min(editor.state.doc.content.size, actualTo + flankLimit), '
-');
+    const before = editor.state.doc.textBetween(Math.max(0, from - flankLimit), from, '\n');
+    const after = editor.state.doc.textBetween(actualTo, Math.min(editor.state.doc.content.size, actualTo + flankLimit), '\n');
     const outlineText = extractOutline(documentRef.current.content).map((item) => item.text).join(' › ');
     const chapterSummary = outlineText.length > 2000 ? `${outlineText.slice(0, 2000)}…` : outlineText;
-    const fullText = editor.getText({ blockSeparator: '
-' });
+    const fullText = editor.getText({ blockSeparator: '\n' });
     const evidenceBudget = Math.max(1200, max - selected.length - (flankLimit * 2));
     const evidence = isDiagnosticTask(task) ? buildDocumentEvidence(fullText, evidenceBudget) : null;
     setAIState('running'); setAICollapsed(false);
@@ -458,8 +453,7 @@ ${response.summary}` : response.summary);
         throw new Error('续写的原始插入位置已经无效，请重新生成。');
       }
       await snapshot('插入 AI 续写前');
-      const paragraphs = continuation.text.split(/
-+/).map((value) => value.trim()).filter(Boolean).map((value) => ({ type: 'paragraph', content: [{ type: 'text', text: value }] }));
+      const paragraphs = continuation.text.split(/\n+/).map((value) => value.trim()).filter(Boolean).map((value) => ({ type: 'paragraph', content: [{ type: 'text', text: value }] }));
       if (!paragraphs.length) return;
       editor.chain().focus().setTextSelection(insertionPosition).insertContent(paragraphs).run();
       setContinuation(null);
