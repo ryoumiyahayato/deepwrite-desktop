@@ -17,7 +17,7 @@ export function buildDocumentEvidence(fullText: string, maxChars: number): Docum
   const chunkSize = Math.max(80, Math.floor(usable / segments));
   const maxStart = Math.max(0, text.length - chunkSize);
   const parts = Array.from({ length: segments }, (_, index) => {
-    const ratio = segments === 1 ? 0 : index / (segments - 1);
+    const ratio = index / (segments - 1);
     const start = Math.min(maxStart, Math.floor(maxStart * ratio));
     return text.slice(start, start + chunkSize);
   });
