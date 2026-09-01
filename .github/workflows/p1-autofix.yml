@@ -29,32 +29,28 @@ jobs:
           from pathlib import Path
           path = Path('scripts/p1_autofix.py')
           text = path.read_text(encoding='utf-8')
-          old = '''    if count != 1:
-                  raise RuntimeError(f"{path}: expected exactly one literal match, found {count}: {old[:100]!r}")
-          '''
-          old = '''    if count != 1:
-              raise RuntimeError(f"{path}: expected exactly one literal match, found {count}: {old[:100]!r}")
-          '''
-          new = '''    intentional_duplicate = (
-              path == "src/App.tsx"
-              and "const previousDocumentId = documentRef.current.id" in old
-              and "await applyLoaded(loaded)" in old
-          )
+          start_marker = 'def replace_once(path: str, old: str, new: str) -> None:\n'
+          end_marker = '\n\ndef sub_once(path: str, pattern: str, replacement: str) -> None:\n'
+          if text.count(start_marker) != 1 or text.count(end_marker) != 1:
+              raise SystemExit('replace_once helper boundary mismatch')
+          start = text.index(start_marker)
+          end = text.index(end_marker, start)
+          replacement = '''def replace_once(path: str, old: str, new: str) -> None:
+              content = read(path)
+              count = content.count(old)
+              intentional_duplicate = (
+                  path == "src/App.tsx"
+                  and "const previousDocumentId = documentRef.current.id" in old
+                  and "await applyLoaded(loaded)" in old
+              )
               if count != 1 and not (intentional_duplicate and count == 2):
-              raise RuntimeError(f"{path}: expected one literal match (or the declared two-site open block), found {count}: {old[:100]!r}")
+                  raise RuntimeError(f"{path}: expected one literal match (or the declared two-site open block), found {count}: {old[:100]!r}")
+              write(path, content.replace(old, new, 1))
           '''
-          # Fix indentation in the generated replacement without broadening the assertion.
-          new = '''    intentional_duplicate = (
-              path == "src/App.tsx"
-              and "const previousDocumentId = documentRef.current.id" in old
-              and "await applyLoaded(loaded)" in old
-          )
-          if count != 1 and not (intentional_duplicate and count == 2):
-              raise RuntimeError(f"{path}: expected one literal match (or the declared two-site open block), found {count}: {old[:100]!r}")
-          '''
-          if text.count(old) != 1:
-              raise SystemExit(f'helper baseline mismatch: {text.count(old)} matches')
-          path.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+          # Dedent the function body to normal Python source indentation.
+          import textwrap
+          replacement = textwrap.dedent(replacement)
+          path.write_text(text[:start] + replacement.rstrip() + text[end:], encoding='utf-8', newline='\n')
           PY
       - name: Apply asserted P1 patch
         run: python scripts/p1_autofix.py
@@ -71,6 +67,10 @@ jobs:
                 }
             }
           '''
+          import textwrap
+          old = textwrap.dedent(old)
+          # Restore the Rust indentation after dedenting the heredoc literal.
+          old = ''.join(('            ' + line if line.strip() else line) for line in old.splitlines(keepends=True))
           new = '''            if let Some(document_id) = recovery_document_id(&contents) {
                 let key = recovery_key_from_path(&path).or_else(|| {
                     (path.file_name().and_then(|value| value.to_str()) == Some("pending.dwrite"))
@@ -81,6 +81,8 @@ jobs:
                 }
             }
           '''
+          new = textwrap.dedent(new)
+          new = ''.join(('            ' + line if line.strip() else line) for line in new.splitlines(keepends=True))
           if text.count(old) != 1:
               raise SystemExit(f'legacy recovery patch baseline mismatch: {text.count(old)} matches')
           path.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
