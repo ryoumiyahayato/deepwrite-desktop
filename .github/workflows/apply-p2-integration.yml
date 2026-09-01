@@ -47,4 +47,4 @@ jobs:
           git diff --cached --check
           git commit -m 'fix: close known P2 contracts and menu lifecycle'
           git push origin HEAD:fix/foundational-contracts-20260831
-# retry after explicit test cleanup
+# retry after direct native toggle binding
