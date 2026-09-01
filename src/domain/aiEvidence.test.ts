@@ -18,4 +18,13 @@ describe('document evidence budgeting', () => {
     expect(result.text).toContain('段落999');
     expect(result.scopeLabel).toContain('未覆盖');
   });
+
+  it('does not reduce oversized evidence to only the beginning and end', () => {
+    const source = Array.from({ length: 300 }, (_, index) => `SECTION-${String(index).padStart(3, '0')}-${'x'.repeat(30)}`).join('\n');
+    const result = buildDocumentEvidence(source, 1800);
+    expect(result.complete).toBe(false);
+    expect(result.text).toContain('SECTION-000');
+    expect(result.text).toMatch(/SECTION-1[3-6]\d/);
+    expect(result.text).toContain('SECTION-299');
+  });
 });
