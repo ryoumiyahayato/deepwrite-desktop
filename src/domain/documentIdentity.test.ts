@@ -6,6 +6,12 @@ describe('document physical instance identity', () => {
     expect(normalizeDocumentPath('C:/Books//Draft.dwrite')).toBe('c:\\books\\draft.dwrite');
   });
 
+  it('treats path spelling variants as the same physical document instance', () => {
+    const slashVariant = documentInstanceKey('doc-1', 'C:/Books/Draft.dwrite');
+    const caseVariant = documentInstanceKey('doc-1', 'c:\\books\\DRAFT.dwrite');
+    expect(slashVariant).toBe(caseVariant);
+  });
+
   it('separates hand-copied files that retain the same embedded document id', () => {
     const original = documentInstanceKey('doc-1', 'C:\\Books\\Draft.dwrite');
     const copy = documentInstanceKey('doc-1', 'C:\\Books\\Draft Copy.dwrite');
