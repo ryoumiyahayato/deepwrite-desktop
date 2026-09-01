@@ -94,7 +94,7 @@ jobs:
       - name: Commit repaired contracts and remove one-shot tooling
         shell: bash
         run: |
-          git rm scripts/p1_autofix.py .github/workflows/p1-autofix.yml
+          git rm -f scripts/p1_autofix.py .github/workflows/p1-autofix.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
