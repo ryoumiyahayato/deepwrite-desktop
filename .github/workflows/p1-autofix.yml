@@ -27,6 +27,7 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import textwrap
           path = Path('scripts/p1_autofix.py')
           text = path.read_text(encoding='utf-8')
           start_marker = 'def replace_once(path: str, old: str, new: str) -> None:\n'
@@ -35,7 +36,8 @@ jobs:
               raise SystemExit('replace_once helper boundary mismatch')
           start = text.index(start_marker)
           end = text.index(end_marker, start)
-          replacement = '''def replace_once(path: str, old: str, new: str) -> None:
+          replacement = textwrap.dedent('''
+          def replace_once(path: str, old: str, new: str) -> None:
               content = read(path)
               count = content.count(old)
               intentional_duplicate = (
@@ -46,10 +48,7 @@ jobs:
               if count != 1 and not (intentional_duplicate and count == 2):
                   raise RuntimeError(f"{path}: expected one literal match (or the declared two-site open block), found {count}: {old[:100]!r}")
               write(path, content.replace(old, new, 1))
-          '''
-          # Dedent the function body to normal Python source indentation.
-          import textwrap
-          replacement = textwrap.dedent(replacement)
+          ''').lstrip()
           path.write_text(text[:start] + replacement.rstrip() + text[end:], encoding='utf-8', newline='\n')
           PY
       - name: Apply asserted P1 patch
@@ -59,33 +58,36 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import re
           path = Path('src-tauri/src/commands.rs')
           text = path.read_text(encoding='utf-8')
-          old = '''            if recovery_document_id(&contents).is_some() {
-                if let Some(key) = recovery_key_from_path(&path) {
-                    return Ok(Some(RecoveryPayload { key, contents }));
-                }
-            }
-          '''
-          import textwrap
-          old = textwrap.dedent(old)
-          # Restore the Rust indentation after dedenting the heredoc literal.
-          old = ''.join(('            ' + line if line.strip() else line) for line in old.splitlines(keepends=True))
-          new = '''            if let Some(document_id) = recovery_document_id(&contents) {
-                let key = recovery_key_from_path(&path).or_else(|| {
-                    (path.file_name().and_then(|value| value.to_str()) == Some("pending.dwrite"))
-                        .then_some(document_id)
-                });
-                if let Some(key) = key {
-                    return Ok(Some(RecoveryPayload { key, contents }));
-                }
-            }
-          '''
-          new = textwrap.dedent(new)
-          new = ''.join(('            ' + line if line.strip() else line) for line in new.splitlines(keepends=True))
-          if text.count(old) != 1:
-              raise SystemExit(f'legacy recovery patch baseline mismatch: {text.count(old)} matches')
-          path.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+          pattern = re.compile(
+              r'(?m)^(?P<i>[ \t]*)if recovery_document_id\(&contents\)\.is_some\(\) \{\n'
+              r'(?P=i)    if let Some\(key\) = recovery_key_from_path\(&path\) \{\n'
+              r'(?P=i)        return Ok\(Some\(RecoveryPayload \{ key, contents \}\)\);\n'
+              r'(?P=i)    \}\n'
+              r'(?P=i)\}'
+          )
+          matches = list(pattern.finditer(text))
+          if len(matches) != 1:
+              raise SystemExit(f'legacy recovery semantic baseline mismatch: {len(matches)} matches')
+          indent = matches[0].group('i')
+          lines = [
+              'if let Some(document_id) = recovery_document_id(&contents) {',
+              '    let key = recovery_key_from_path(&path).or_else(|| {',
+              '        (path.file_name().and_then(|value| value.to_str()) == Some("pending.dwrite"))',
+              '            .then_some(document_id)',
+              '    });',
+              '    if let Some(key) = key {',
+              '        return Ok(Some(RecoveryPayload { key, contents }));',
+              '    }',
+              '}',
+          ]
+          replacement = '\n'.join(indent + line for line in lines)
+          text, count = pattern.subn(lambda _: replacement, text, count=1)
+          if count != 1:
+              raise SystemExit('legacy recovery replacement count changed unexpectedly')
+          path.write_text(text, encoding='utf-8', newline='\n')
           PY
       - name: Validate patch whitespace
         run: git diff --check
