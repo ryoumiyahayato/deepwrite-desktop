@@ -100,7 +100,7 @@ impl SaveMutex {
         let name = format!("Local\\DeepWriteSave-{:016x}", hasher.finish());
         let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
-        if handle == 0 {
+        if handle.is_null() {
             return Err(safe_error(
                 "无法创建文档保存互斥锁",
                 std::io::Error::last_os_error(),
@@ -215,6 +215,25 @@ pub fn read_binary(path: String) -> Result<Vec<u8>, String> {
     fs::read(path).map_err(|e| safe_error("无法读取文件", e))
 }
 
+fn dwrite_path_from_arguments<I>(arguments: I) -> Option<String>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    arguments.into_iter().find_map(|argument| {
+        let path = PathBuf::from(argument);
+        let is_dwrite = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("dwrite"));
+        is_dwrite.then(|| path.to_string_lossy().into_owned())
+    })
+}
+
+#[tauri::command]
+pub fn startup_document_path() -> Option<String> {
+    dwrite_path_from_arguments(std::env::args_os().skip(1))
+}
+
 fn recovery_dir(app: &AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_local_data_dir()
@@ -244,8 +263,20 @@ pub fn write_recovery(app: AppHandle, document_id: String, contents: String) -> 
     atomic_write(recovery_path(&app, &document_id)?, contents.as_bytes())
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryPayload {
+    pub key: String,
+    pub contents: String,
+}
+
+fn recovery_key_from_path(path: &Path) -> Option<String> {
+    let encoded = path.file_stem()?.to_str()?;
+    String::from_utf8(hex::decode(encoded).ok()?).ok()
+}
+
 #[tauri::command]
-pub fn read_recovery(app: AppHandle) -> Result<Option<String>, String> {
+pub fn read_recovery(app: AppHandle) -> Result<Option<RecoveryPayload>, String> {
     let directory = recovery_dir(&app)?;
     if !directory.exists() {
         return Ok(None);
@@ -271,8 +302,14 @@ pub fn read_recovery(app: AppHandle) -> Result<Option<String>, String> {
 
     for (_, path) in candidates {
         if let Ok(contents) = fs::read_to_string(&path) {
-            if recovery_document_id(&contents).is_some() {
-                return Ok(Some(contents));
+            if let Some(document_id) = recovery_document_id(&contents) {
+                let key = recovery_key_from_path(&path).or_else(|| {
+                    (path.file_name().and_then(|value| value.to_str()) == Some("pending.dwrite"))
+                        .then_some(document_id)
+                });
+                if let Some(key) = key {
+                    return Ok(Some(RecoveryPayload { key, contents }));
+                }
             }
         }
     }
@@ -469,5 +506,18 @@ mod tests {
         assert!(error.contains("保存冲突"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "first");
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn startup_document_argument_accepts_only_dwrite_paths() {
+        let args = vec![
+            std::ffi::OsString::from("notes.txt"),
+            std::ffi::OsString::from(r"C:\Drafts\novel.dwrite"),
+        ];
+        assert_eq!(
+            dwrite_path_from_arguments(args).as_deref(),
+            Some(r"C:\Drafts\novel.dwrite")
+        );
+        assert!(dwrite_path_from_arguments(vec![std::ffi::OsString::from("notes.md")]).is_none());
     }
 }

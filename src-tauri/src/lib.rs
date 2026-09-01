@@ -66,6 +66,7 @@ pub fn run() {
             commands::read_text,
             commands::read_text_if_exists,
             commands::read_binary,
+            commands::startup_document_path,
             commands::write_recovery,
             commands::read_recovery,
             commands::clear_recovery,

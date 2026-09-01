@@ -11,6 +11,8 @@ import { OutlinePanel } from './components/OutlinePanel';
 import { StatusBar } from './components/StatusBar';
 import { Toolbar } from './components/Toolbar';
 import { createSuggestionContext, isSuggestionStale, stableHash, type AISuggestion, type SuggestionContext } from './domain/ai';
+import { buildDocumentEvidence } from './domain/aiEvidence';
+import { documentInstanceKey } from './domain/documentIdentity';
 import { recentContext, shouldAutoAnalyze } from './domain/autoAnalysis';
 import {
   createDocument,
@@ -35,16 +37,19 @@ import {
   type RecentFile,
   type VersionRecord
 } from './services/database';
-import { requestSuggestions, testDeepSeekConnection, type AITask } from './services/deepseek';
+import { isDiagnosticTask, requestSuggestions, testDeepSeekConnection, type AITask } from './services/deepseek';
 import {
   chooseAndOpenDocument,
   clearRecovery,
+  clearRecoveryKey,
   exportDocument,
   openDocumentAtPath,
   readRecovery,
   saveDwrite,
+  startupDocumentPath,
   writeRecovery,
-  type ImportedContent
+  type ImportedContent,
+  type RecoveredDwrite
 } from './services/documentFiles';
 import { chooseOpenPath, fileNameFromPath, isTauri, readBinary } from './services/platform';
 import { deleteDeepSeekKey, hasDeepSeekKey, saveDeepSeekKey } from './services/secrets';
@@ -55,7 +60,7 @@ interface GeneratedContinuation { text: string; context: SuggestionContext }
 
 function buildVersion(document: DeepWriteDocument, path: string | null, reason: string): VersionRecord {
   return {
-    id: crypto.randomUUID(), documentId: document.id, documentPath: path,
+    id: crypto.randomUUID(), documentId: documentInstanceKey(document.id, path), documentPath: path,
     createdAt: new Date().toISOString(), reason,
     wordCount: documentStats(plainText(document.content)).words,
     snapshot: structuredClone(document)
@@ -87,7 +92,7 @@ export default function App() {
   const [storedKey, setStoredKey] = useState(false);
   const [findMode, setFindMode] = useState<'find' | 'replace' | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
-  const [recovery, setRecovery] = useState<DeepWriteDocument | null>(null);
+  const [recovery, setRecovery] = useState<RecoveredDwrite | null>(null);
   const [error, setError] = useState('');
   const loadingRef = useRef(false);
   const documentRef = useRef(document);
@@ -95,6 +100,7 @@ export default function App() {
   const settingsRef = useRef(settings);
   const saveStateRef = useRef(saveState);
   const lastAutoHash = useRef<string | null>(null);
+  const startupOpenAttemptedRef = useRef(false);
 
   useEffect(() => { documentRef.current = document; }, [document]);
   useEffect(() => { pathRef.current = path; }, [path]);
@@ -142,14 +148,14 @@ export default function App() {
     const timer = window.setTimeout(async () => {
       const current = documentRef.current;
       try {
-        await writeRecovery(current);
+        await writeRecovery(current, pathRef.current);
         if (settingsRef.current.general.autosaveEnabled && pathRef.current) {
           setSaveState('saving');
           await saveDwrite(current, pathRef.current, false, settingsRef.current.general.defaultSaveDirectory);
           const stillCurrent = documentRef.current.id === current.id && documentRef.current.revision === current.revision;
           if (stillCurrent) {
             setSaveState('saved');
-            await clearRecovery(current.id);
+            await clearRecovery(current.id, pathRef.current);
           } else {
             setSaveState('unsaved');
           }
@@ -168,9 +174,10 @@ export default function App() {
   const manualSave = useCallback(async (saveAs = false): Promise<boolean> => {
     if (!editor) return false;
     const source = { ...documentRef.current, content: editor.getJSON(), updatedAt: new Date().toISOString() };
+    const sourcePath = pathRef.current;
     setSaveState('saving');
     try {
-      const saved = await saveDwrite(source, pathRef.current, saveAs, settingsRef.current.general.defaultSaveDirectory);
+      const saved = await saveDwrite(source, sourcePath, saveAs, settingsRef.current.general.defaultSaveDirectory);
       if (!saved) { setSaveState('unsaved'); return false; }
       const stillCurrent = documentRef.current.id === source.id && documentRef.current.revision === source.revision;
       await addRecentFile(saved.path, saved.document.title, settingsRef.current.general.recentFilesLimit);
@@ -187,13 +194,13 @@ export default function App() {
       documentRef.current = saved.document;
       setDocument(saved.document);
       setSaveState('saved');
-      await clearRecovery(source.id);
+      await clearRecovery(source.id, sourcePath);
       if (identityChanged) {
         setSuggestions([]); setContinuation(null); setAISummary(''); editor.commands.setAiSuggestionDecorations([]);
       }
       return true;
     } catch (caught) {
-      try { await writeRecovery(source); } catch { /* keep the original save error */ }
+      try { await writeRecovery(source, sourcePath); } catch { /* keep the original save error */ }
       setSaveState('error'); setError(`保存失败：${String(caught)}`); return false;
     }
   }, [editor, refreshRecent, snapshot]);
@@ -206,9 +213,9 @@ export default function App() {
     return discard ? 'discard' : 'cancel';
   }, [manualSave]);
 
-  const commitDiscard = useCallback(async (decision: TransitionDecision, documentId: string) => {
+  const commitDiscard = useCallback(async (decision: TransitionDecision, documentId: string, documentPath: string | null) => {
     if (decision !== 'discard') return;
-    try { await clearRecovery(documentId); }
+    try { await clearRecovery(documentId, documentPath); }
     catch (caught) { setError(`已切换文档，但无法清理被放弃文档的恢复副本：${String(caught)}`); }
   }, []);
 
@@ -222,7 +229,7 @@ export default function App() {
         const decision = await prepareDocumentTransition();
         if (decision === 'cancel') return;
         if (decision === 'discard') {
-          try { await clearRecovery(documentRef.current.id); }
+          try { await clearRecovery(documentRef.current.id, pathRef.current); }
           catch (caught) { setError(`无法清理被放弃文档的恢复副本：${String(caught)}`); }
         }
         await appWindow.destroy();
@@ -257,6 +264,15 @@ export default function App() {
     } finally { loadingRef.current = false; }
   }, [editor, refreshRecent]);
 
+  useEffect(() => {
+    if (!editor || !isTauri() || startupOpenAttemptedRef.current) return;
+    startupOpenAttemptedRef.current = true;
+    void startupDocumentPath().then(async (startupPath) => {
+      if (!startupPath) return;
+      await applyLoaded(await openDocumentAtPath(startupPath));
+    }).catch((caught) => setError(`无法打开由文件关联启动的文档：${String(caught)}`));
+  }, [applyLoaded, editor]);
+
   const openFile = useCallback(async () => {
     try {
       const loaded = await chooseAndOpenDocument();
@@ -264,8 +280,9 @@ export default function App() {
       const decision = await prepareDocumentTransition();
       if (decision === 'cancel') return;
       const previousDocumentId = documentRef.current.id;
+      const previousPath = pathRef.current;
       await applyLoaded(loaded);
-      await commitDiscard(decision, previousDocumentId);
+      await commitDiscard(decision, previousDocumentId, previousPath);
     } catch (caught) { setError(`打开失败：${String(caught)}`); }
   }, [applyLoaded, commitDiscard, prepareDocumentTransition]);
 
@@ -275,8 +292,9 @@ export default function App() {
       const decision = await prepareDocumentTransition();
       if (decision === 'cancel') return;
       const previousDocumentId = documentRef.current.id;
+      const previousPath = pathRef.current;
       await applyLoaded(loaded);
-      await commitDiscard(decision, previousDocumentId);
+      await commitDiscard(decision, previousDocumentId, previousPath);
     } catch (caught) { setError(`无法打开最近文件：${String(caught)}`); }
   }, [applyLoaded, commitDiscard, prepareDocumentTransition]);
 
@@ -285,13 +303,14 @@ export default function App() {
     const decision = await prepareDocumentTransition();
     if (decision === 'cancel') return;
     const previousDocumentId = documentRef.current.id;
+    const previousPath = pathRef.current;
     const created = createDocument();
     loadingRef.current = true;
     editor.commands.setContent(created.content, { emitUpdate: false });
     loadingRef.current = false;
     setDocument(created); setPath(null); setSaveState('unsaved'); setSuggestions([]); setContinuation(null); setAISummary('');
     editor.commands.setAiSuggestionDecorations([]);
-    await commitDiscard(decision, previousDocumentId);
+    await commitDiscard(decision, previousDocumentId, previousPath);
   }, [commitDiscard, editor, prepareDocumentTransition]);
 
   const runExport = useCallback(async (format: 'docx' | 'txt' | 'md' | 'html') => {
@@ -314,28 +333,49 @@ export default function App() {
   const performAI = useCallback(async (task: AITask, forced?: { from: number; to: number; text: string }) => {
     if (!editor) return;
     const { from: selectedFrom, to: selectedTo } = editor.state.selection;
-    let from = forced?.from ?? selectedFrom; const to = forced?.to ?? selectedTo;
-    let selected = forced?.text ?? editor.state.doc.textBetween(from, to, '\n');
-    if (!selected.trim()) {
-      if (task !== 'continue') { setError('请先选择要分析的文字。'); return; }
-      const end = editor.state.doc.content.size;
-      from = Math.max(0, end - 2000); selected = editor.state.doc.textBetween(from, end, '\n');
-    }
-    const actualTo = task === 'continue' && !forced?.text && selectedFrom === selectedTo ? editor.state.doc.content.size : to;
     const max = settingsRef.current.ai.maxContextCharacters;
-    if (selected.length > max) selected = selected.slice(0, max);
+    let from = forced?.from ?? selectedFrom;
+    let actualTo = forced?.to ?? selectedTo;
+    let selected = forced?.text ?? editor.state.doc.textBetween(from, actualTo, '
+');
+
+    if (!forced && task === 'continue' && selectedFrom === selectedTo) {
+      actualTo = selectedTo;
+      from = Math.max(0, actualTo - Math.min(max, 4000));
+      selected = editor.state.doc.textBetween(from, actualTo, '
+');
+    }
+    if (!selected.trim() && task !== 'continue') { setError('请先选择要分析的文字。'); return; }
+
+    const selectedLimit = Math.max(1000, Math.floor(max * 0.4));
+    if (selected.length > selectedLimit) selected = task === 'continue' ? selected.slice(-selectedLimit) : selected.slice(0, selectedLimit);
     const customInstruction = task === 'custom' ? window.prompt('请输入自定义写作要求') ?? '' : undefined;
     if (task === 'custom' && !customInstruction?.trim()) return;
     const context = createSuggestionContext(documentRef.current.id, documentRef.current.revision, from, actualTo, selected);
-    const before = editor.state.doc.textBetween(Math.max(0, from - Math.floor(max / 3)), from, '\n');
-    const after = editor.state.doc.textBetween(actualTo, Math.min(editor.state.doc.content.size, actualTo + Math.floor(max / 3)), '\n');
-    const chapterSummary = extractOutline(documentRef.current.content).slice(-3).map((item) => item.text).join(' › ');
+    const flankLimit = Math.max(400, Math.floor(max * 0.15));
+    const before = editor.state.doc.textBetween(Math.max(0, from - flankLimit), from, '
+');
+    const after = editor.state.doc.textBetween(actualTo, Math.min(editor.state.doc.content.size, actualTo + flankLimit), '
+');
+    const outlineText = extractOutline(documentRef.current.content).map((item) => item.text).join(' › ');
+    const chapterSummary = outlineText.length > 2000 ? `${outlineText.slice(0, 2000)}…` : outlineText;
+    const fullText = editor.getText({ blockSeparator: '
+' });
+    const evidenceBudget = Math.max(1200, max - selected.length - (flankLimit * 2));
+    const evidence = isDiagnosticTask(task) ? buildDocumentEvidence(fullText, evidenceBudget) : null;
     setAIState('running'); setAICollapsed(false);
     if (task !== 'continue') setContinuation(null);
     try {
-      const response = await requestSuggestions(task, { selected, before, after, chapterSummary, authorRules: settingsRef.current.ai.authorRules, customInstruction }, settingsRef.current, context);
+      const response = await requestSuggestions(task, {
+        selected, before, after, chapterSummary,
+        documentEvidence: evidence?.text,
+        scopeLabel: evidence?.scopeLabel,
+        authorRules: settingsRef.current.ai.authorRules,
+        customInstruction
+      }, settingsRef.current, context);
       if (documentRef.current.id !== context.documentId) { setAIState('idle'); return; }
-      setAISummary(response.summary);
+      setAISummary(evidence?.scopeLabel ? `${evidence.scopeLabel}
+${response.summary}` : response.summary);
       if (task === 'continue') {
         const generated = response.fullRewrite?.trim();
         if (!generated) throw new Error('DeepSeek 没有返回可用的续写正文。');
@@ -413,10 +453,15 @@ export default function App() {
       return;
     }
     try {
+      const insertionPosition = continuation.context.selectionTo;
+      if (insertionPosition < 1 || insertionPosition > editor.state.doc.content.size) {
+        throw new Error('续写的原始插入位置已经无效，请重新生成。');
+      }
       await snapshot('插入 AI 续写前');
-      const paragraphs = continuation.text.split(/\n+/).map((value) => value.trim()).filter(Boolean).map((value) => ({ type: 'paragraph', content: [{ type: 'text', text: value }] }));
+      const paragraphs = continuation.text.split(/
++/).map((value) => value.trim()).filter(Boolean).map((value) => ({ type: 'paragraph', content: [{ type: 'text', text: value }] }));
       if (!paragraphs.length) return;
-      editor.chain().focus('end').insertContent(paragraphs).run();
+      editor.chain().focus().setTextSelection(insertionPosition).insertContent(paragraphs).run();
       setContinuation(null);
     } catch (caught) { setError(`插入续写失败：${String(caught)}`); }
   }, [continuation, editor, snapshot]);
@@ -463,13 +508,13 @@ export default function App() {
   }, [editor]);
 
   const openHistory = useCallback(async () => {
-    try { setVersions(await listVersions(documentRef.current.id)); setHistoryOpen(true); }
+    try { setVersions(await listVersions(documentInstanceKey(documentRef.current.id, pathRef.current))); setHistoryOpen(true); }
     catch (caught) { setError(`无法加载版本历史：${String(caught)}`); }
   }, []);
 
   const clearHistory = useCallback(async () => {
     if (!window.confirm('确定清除当前文档保存在本机 SQLite 中的全部版本快照吗？此操作不可撤销。')) return;
-    try { await clearVersions(documentRef.current.id); setVersions([]); }
+    try { await clearVersions(documentInstanceKey(documentRef.current.id, pathRef.current)); setVersions([]); }
     catch (caught) { setError(`清除版本历史失败：${String(caught)}`); }
   }, []);
 
@@ -520,7 +565,7 @@ export default function App() {
     {settingsOpen ? <SettingsDialog initial={settings} hasKey={storedKey} onClose={() => setSettingsOpen(false)} onSave={saveAppSettings} onSaveKey={async (key) => { await saveDeepSeekKey(key); setStoredKey(true); }} onDeleteKey={async () => { await deleteDeepSeekKey(); setStoredKey(false); }} onTest={testDeepSeekConnection} /> : null}
     {findMode ? <FindReplaceDialog replaceMode={findMode === 'replace'} onClose={() => setFindMode(null)} onFind={findText} onReplace={replaceText} onReplaceAll={replaceAll} /> : null}
     {historyOpen ? <HistoryDialog versions={versions} onClose={() => setHistoryOpen(false)} onRestore={(version) => void restoreVersion(version)} onClear={() => void clearHistory()} /> : null}
-    {recovery ? <RecoveryDialog document={recovery} onRestore={() => { if (editor) { loadingRef.current = true; editor.commands.setContent(recovery.content, { emitUpdate: false }); loadingRef.current = false; editor.commands.setAiSuggestionDecorations([]); } setDocument(recovery); setPath(null); setSaveState('unsaved'); setSuggestions([]); setContinuation(null); setAISummary(''); setRecovery(null); }} onDiscard={() => { const discarded = recovery; void clearRecovery(discarded.id).then(() => readRecovery()).then(setRecovery).catch((caught) => { setRecovery(null); setError(`清理恢复内容失败：${String(caught)}`); }); }} /> : null}
+    {recovery ? <RecoveryDialog document={recovery.document} onRestore={() => { const recovered = recovery; if (editor) { loadingRef.current = true; editor.commands.setContent(recovered.document.content, { emitUpdate: false }); loadingRef.current = false; editor.commands.setAiSuggestionDecorations([]); } setDocument(recovered.document); setPath(null); setSaveState('unsaved'); setSuggestions([]); setContinuation(null); setAISummary(''); setRecovery(null); void writeRecovery(recovered.document, null).then(() => clearRecoveryKey(recovered.key)).catch((caught) => setError(`迁移恢复内容失败：${String(caught)}`)); }} onDiscard={() => { const discarded = recovery; void clearRecoveryKey(discarded.key).then(() => readRecovery()).then(setRecovery).catch((caught) => { setRecovery(null); setError(`清理恢复内容失败：${String(caught)}`); }); }} /> : null}
     {error ? <ErrorNotice message={error} onClose={() => setError('')} /> : null}
   </div>;
 }

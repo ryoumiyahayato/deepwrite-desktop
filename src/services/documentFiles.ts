@@ -8,6 +8,7 @@ import {
   serializeDocument,
   type DeepWriteDocument
 } from '../domain/document';
+import { documentInstanceKey, normalizeDocumentPath } from '../domain/documentIdentity';
 import {
   atomicWriteBinary,
   atomicWriteText,
@@ -32,6 +33,16 @@ export interface SavedDwrite {
   diskContents: string;
 }
 
+export interface RecoveredDwrite {
+  key: string;
+  document: DeepWriteDocument;
+}
+
+interface RecoveryPayload {
+  key: string;
+  contents: string;
+}
+
 const diskBaselines = new Map<string, string>();
 const htmlEscape = (input: string) => input.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char] ?? char);
 
@@ -40,12 +51,8 @@ function suggestedPath(directory: string, fileName: string): string {
   return trimmed ? `${trimmed}\\${fileName}` : fileName;
 }
 
-function normalizedPath(path: string): string {
-  return path.replace(/\//g, '\\').replace(/\\+/g, '\\').toLocaleLowerCase('en-US');
-}
-
 export function sameDocumentPath(left: string | null, right: string | null): boolean {
-  return Boolean(left && right && normalizedPath(left) === normalizedPath(right));
+  return Boolean(left && right && normalizeDocumentPath(left) === normalizeDocumentPath(right));
 }
 
 export async function chooseAndOpenDocument(): Promise<ImportedContent | null> {
@@ -57,7 +64,7 @@ export async function openDocumentAtPath(path: string): Promise<ImportedContent>
   const extension = extensionFromPath(path);
   if (extension === 'dwrite') {
     const diskContents = await readText(path);
-    diskBaselines.set(normalizedPath(path), diskContents);
+    diskBaselines.set(normalizeDocumentPath(path), diskContents);
     return { kind: 'document', document: parseDocument(diskContents), path, diskContents, warnings: [] };
   }
   if (extension === 'docx') {
@@ -88,7 +95,7 @@ export async function saveDwrite(
   const writingCurrentPath = sameDocumentPath(path, currentPath);
   const isFork = saveAs && Boolean(currentPath) && !writingCurrentPath;
   const savedDocument = isFork ? forkDocumentForSaveAs(document) : document;
-  const key = normalizedPath(path);
+  const key = normalizeDocumentPath(path);
   const targetBaseline = writingCurrentPath
     ? (diskBaselines.get(key) ?? null)
     : await readTextIfExists(path);
@@ -121,18 +128,29 @@ export async function exportDocument(
   return path;
 }
 
-export async function writeRecovery(document: DeepWriteDocument): Promise<void> {
-  await invokeCommand('write_recovery', { documentId: document.id, contents: serializeDocument(document) });
+export async function writeRecovery(document: DeepWriteDocument, path: string | null): Promise<void> {
+  await invokeCommand('write_recovery', {
+    documentId: documentInstanceKey(document.id, path),
+    contents: serializeDocument(document)
+  });
 }
 
-export async function readRecovery(): Promise<DeepWriteDocument | null> {
-  const contents = await invokeCommand<string | null>('read_recovery');
-  if (!contents) return null;
-  return parseDocument(contents);
+export async function readRecovery(): Promise<RecoveredDwrite | null> {
+  const payload = await invokeCommand<RecoveryPayload | null>('read_recovery');
+  if (!payload) return null;
+  return { key: payload.key, document: parseDocument(payload.contents) };
 }
 
-export async function clearRecovery(documentId: string): Promise<void> {
-  await invokeCommand('clear_recovery', { documentId });
+export async function clearRecovery(documentId: string, path: string | null): Promise<void> {
+  await clearRecoveryKey(documentInstanceKey(documentId, path));
+}
+
+export async function clearRecoveryKey(key: string): Promise<void> {
+  await invokeCommand('clear_recovery', { documentId: key });
+}
+
+export async function startupDocumentPath(): Promise<string | null> {
+  return invokeCommand<string | null>('startup_document_path');
 }
 
 export function importedHtmlDocument(title: string, content: JSONContent): DeepWriteDocument {
