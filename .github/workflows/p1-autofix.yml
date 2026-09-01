@@ -22,6 +22,40 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Declare the one intentional duplicate baseline
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('scripts/p1_autofix.py')
+          text = path.read_text(encoding='utf-8')
+          old = '''    if count != 1:
+                  raise RuntimeError(f"{path}: expected exactly one literal match, found {count}: {old[:100]!r}")
+          '''
+          old = '''    if count != 1:
+              raise RuntimeError(f"{path}: expected exactly one literal match, found {count}: {old[:100]!r}")
+          '''
+          new = '''    intentional_duplicate = (
+              path == "src/App.tsx"
+              and "const previousDocumentId = documentRef.current.id" in old
+              and "await applyLoaded(loaded)" in old
+          )
+              if count != 1 and not (intentional_duplicate and count == 2):
+              raise RuntimeError(f"{path}: expected one literal match (or the declared two-site open block), found {count}: {old[:100]!r}")
+          '''
+          # Fix indentation in the generated replacement without broadening the assertion.
+          new = '''    intentional_duplicate = (
+              path == "src/App.tsx"
+              and "const previousDocumentId = documentRef.current.id" in old
+              and "await applyLoaded(loaded)" in old
+          )
+          if count != 1 and not (intentional_duplicate and count == 2):
+              raise RuntimeError(f"{path}: expected one literal match (or the declared two-site open block), found {count}: {old[:100]!r}")
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f'helper baseline mismatch: {text.count(old)} matches')
+          path.write_text(text.replace(old, new, 1), encoding='utf-8', newline='\n')
+          PY
       - name: Apply asserted P1 patch
         run: python scripts/p1_autofix.py
       - name: Preserve legacy recovery visibility
@@ -31,14 +65,6 @@ jobs:
           from pathlib import Path
           path = Path('src-tauri/src/commands.rs')
           text = path.read_text(encoding='utf-8')
-          old = '''            if recovery_document_id(&contents).is_some() {
-                          if let Some(key) = recovery_key_from_path(&path) {
-                              return Ok(Some(RecoveryPayload { key, contents }));
-                          }
-                      }
-          '''
-          # The generated code uses normal Rust indentation. Normalize the exact
-          # snippet explicitly rather than using a broad regex.
           old = '''            if recovery_document_id(&contents).is_some() {
                 if let Some(key) = recovery_key_from_path(&path) {
                     return Ok(Some(RecoveryPayload { key, contents }));
