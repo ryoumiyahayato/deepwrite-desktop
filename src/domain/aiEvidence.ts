@@ -2,28 +2,43 @@ export interface DocumentEvidence {
   text: string;
   scopeLabel: string;
   complete: boolean;
+  index: number;
+  total: number;
+  start: number;
+  end: number;
+}
+
+export function buildDocumentEvidenceBatches(fullText: string, maxChars: number): DocumentEvidence[] {
+  const text = fullText.trim();
+  const budget = Math.max(1200, Math.floor(maxChars));
+  if (!text.length) {
+    return [{ text: '', scopeLabel: '分析范围：当前文档为空。', complete: true, index: 1, total: 1, start: 0, end: 0 }];
+  }
+  if (text.length <= budget) {
+    return [{ text, scopeLabel: '分析范围：当前文档全文。', complete: true, index: 1, total: 1, start: 0, end: text.length }];
+  }
+
+  const overlap = Math.min(320, Math.max(120, Math.floor(budget * 0.08)));
+  const step = Math.max(1, budget - overlap);
+  const ranges: Array<{ start: number; end: number }> = [];
+  for (let start = 0; start < text.length; start += step) {
+    const end = Math.min(text.length, start + budget);
+    ranges.push({ start, end });
+    if (end === text.length) break;
+  }
+
+  const total = ranges.length;
+  return ranges.map(({ start, end }, offset) => ({
+    text: text.slice(start, end),
+    scopeLabel: `分析范围：全文分块 ${offset + 1}/${total}，字符 ${start + 1}-${end}。所有分块完成后才可形成全局结论。`,
+    complete: false,
+    index: offset + 1,
+    total,
+    start,
+    end
+  }));
 }
 
 export function buildDocumentEvidence(fullText: string, maxChars: number): DocumentEvidence {
-  const text = fullText.trim();
-  const budget = Math.max(1200, Math.floor(maxChars));
-  if (text.length <= budget) {
-    return { text, scopeLabel: '分析范围：当前文档全文。', complete: true };
-  }
-
-  const segments = 5;
-  const separator = '\n…[文档抽样分隔]…\n';
-  const usable = Math.max(segments * 80, budget - separator.length * (segments - 1));
-  const chunkSize = Math.max(80, Math.floor(usable / segments));
-  const maxStart = Math.max(0, text.length - chunkSize);
-  const parts = Array.from({ length: segments }, (_, index) => {
-    const ratio = index / (segments - 1);
-    const start = Math.min(maxStart, Math.floor(maxStart * ratio));
-    return text.slice(start, start + chunkSize);
-  });
-  return {
-    text: parts.join(separator).slice(0, budget),
-    scopeLabel: '分析范围：文档超过上下文预算，已按全文位置均匀抽样；未覆盖部分不能据此判定不存在矛盾或人物偏差。',
-    complete: false
-  };
+  return buildDocumentEvidenceBatches(fullText, maxChars)[0];
 }
