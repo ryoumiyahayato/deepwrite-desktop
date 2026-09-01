@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildDocumentEvidence } from './aiEvidence';
+import { buildDocumentEvidence, buildDocumentEvidenceBatches } from './aiEvidence';
 
 describe('document evidence budgeting', () => {
   it('uses the full document when it fits', () => {
@@ -9,22 +9,28 @@ describe('document evidence budgeting', () => {
     expect(result.scopeLabel).toContain('全文');
   });
 
-  it('samples across an oversized document and discloses the limitation', () => {
+  it('covers every part of an oversized document with bounded overlapping batches', () => {
     const source = Array.from({ length: 1000 }, (_, index) => `段落${index}`).join('\n');
-    const result = buildDocumentEvidence(source, 1600);
-    expect(result.complete).toBe(false);
-    expect(result.text.length).toBeLessThanOrEqual(1600);
-    expect(result.text).toContain('段落0');
-    expect(result.text).toContain('段落999');
-    expect(result.scopeLabel).toContain('未覆盖');
+    const batches = buildDocumentEvidenceBatches(source, 1600);
+    expect(batches.length).toBeGreaterThan(1);
+    expect(batches.every((batch) => batch.text.length <= 1600)).toBe(true);
+    expect(batches[0].start).toBe(0);
+    expect(batches.at(-1)?.end).toBe(source.length);
+    for (let index = 1; index < batches.length; index += 1) {
+      expect(batches[index].start).toBeLessThanOrEqual(batches[index - 1].end);
+    }
+    expect(batches.map((batch) => batch.text).join('\n')).toContain('段落0');
+    expect(batches.map((batch) => batch.text).join('\n')).toContain('段落999');
+    expect(batches[0].scopeLabel).toContain(`1/${batches.length}`);
   });
 
-  it('does not reduce oversized evidence to only the beginning and end', () => {
+  it('does not silently fall back to five representative samples', () => {
     const source = Array.from({ length: 300 }, (_, index) => `SECTION-${String(index).padStart(3, '0')}-${'x'.repeat(30)}`).join('\n');
-    const result = buildDocumentEvidence(source, 1800);
-    expect(result.complete).toBe(false);
-    expect(result.text).toContain('SECTION-000');
-    expect(result.text).toMatch(/SECTION-1[3-6]\d/);
-    expect(result.text).toContain('SECTION-299');
+    const batches = buildDocumentEvidenceBatches(source, 1800);
+    const covered = batches.map((batch) => batch.text).join('\n');
+    expect(batches.length).toBeGreaterThan(5);
+    expect(covered).toContain('SECTION-000');
+    expect(covered).toContain('SECTION-150');
+    expect(covered).toContain('SECTION-299');
   });
 });
