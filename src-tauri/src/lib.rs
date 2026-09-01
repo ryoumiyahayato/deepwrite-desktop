@@ -1,6 +1,6 @@
 mod commands;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 use tauri_plugin_sql::{Migration, MigrationKind};
 
 fn migrations() -> Vec<Migration> {
@@ -38,12 +38,37 @@ fn migrations() -> Vec<Migration> {
             sql: "DELETE FROM ai_suggestions;",
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 3,
+            description: "deduplicate embedded history image assets",
+            sql: r#"
+              CREATE TABLE IF NOT EXISTS history_assets (
+                asset_key TEXT PRIMARY KEY, data_uri TEXT NOT NULL, created_at TEXT NOT NULL
+              );
+            "#,
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default();
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if let Some(path) = commands::dwrite_path_from_arguments(args.into_iter().skip(1)) {
+                let _ = app.emit("deepwrite://open-document", path);
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.unminimize();
+                let _ = window.set_focus();
+            }
+        }));
+    }
+
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_sql::Builder::default()

@@ -215,12 +215,13 @@ pub fn read_binary(path: String) -> Result<Vec<u8>, String> {
     fs::read(path).map_err(|e| safe_error("无法读取文件", e))
 }
 
-fn dwrite_path_from_arguments<I>(arguments: I) -> Option<String>
+pub(crate) fn dwrite_path_from_arguments<I, S>(arguments: I) -> Option<String>
 where
-    I: IntoIterator<Item = std::ffi::OsString>,
+    I: IntoIterator<Item = S>,
+    S: Into<std::ffi::OsString>,
 {
     arguments.into_iter().find_map(|argument| {
-        let path = PathBuf::from(argument);
+        let path = PathBuf::from(argument.into());
         let is_dwrite = path
             .extension()
             .and_then(|extension| extension.to_str())
