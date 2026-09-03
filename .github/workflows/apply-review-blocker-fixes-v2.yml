@@ -29,12 +29,13 @@ jobs:
           components: rustfmt
       - name: Apply guarded review fixes
         run: python scripts/apply-review-blocker-fixes.py
-      - name: Complete React hook dependencies
+      - name: Complete React hook dependencies and recovery fixture
         run: |
           python - <<'PY'
           from pathlib import Path
-          path = Path('src/App.tsx')
-          text = path.read_text(encoding='utf-8')
+
+          app = Path('src/App.tsx')
+          text = app.read_text(encoding='utf-8')
           replacements = [
               ('  }, [editor, refreshRecent]);', '  }, [editor, refreshRecent, updateSaveState]);'),
               ('  }, [commitDiscard, editor, prepareDocumentTransition]);', '  }, [commitDiscard, editor, prepareDocumentTransition, updateSaveState]);'),
@@ -44,7 +45,19 @@ jobs:
               if text.count(old) != 1:
                   raise SystemExit(f'expected exactly one hook dependency match: {old!r}')
               text = text.replace(old, new, 1)
-          path.write_text(text, encoding='utf-8')
+          app.write_text(text, encoding='utf-8')
+
+          test = Path('src/services/documentFiles.test.ts')
+          text = test.read_text(encoding='utf-8')
+          import_anchor = "import { describe, expect, it } from 'vitest';\n"
+          if text.count(import_anchor) != 1:
+              raise SystemExit('recovery test import anchor mismatch')
+          text = text.replace(import_anchor, import_anchor + "import { createDocument, serializeDocument } from '../domain/document';\n", 1)
+          start = text.index('    const valid = JSON.stringify({')
+          end_marker = '    });\n    const recovered = firstValidRecovery(['
+          end = text.index(end_marker, start)
+          text = text[:start] + "    const valid = serializeDocument({ ...createDocument('可恢复'), id: 'doc-valid', revision: 1 });\n" + text[end + len('    });\n'):]
+          test.write_text(text, encoding='utf-8')
           PY
       - name: Format Rust
         run: cargo fmt --manifest-path src-tauri/Cargo.toml
