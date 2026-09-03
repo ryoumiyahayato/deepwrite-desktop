@@ -9,7 +9,12 @@ export function positionAtTextOffset(
 ): number | null {
   const selected = document.textBetween(from, to, '\n');
   if (offset < 0 || offset > selected.length) return null;
-  if (offset === 0) return from;
+  if (offset === 0) {
+    for (let position = from; position <= to; position += 1) {
+      if (document.resolve(position).parent.inlineContent) return position;
+    }
+    return null;
+  }
 
   let low = from;
   let high = to;

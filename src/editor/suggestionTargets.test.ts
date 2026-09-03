@@ -16,6 +16,13 @@ function paragraph(text: string) {
 }
 
 describe('structured AI suggestion target mapping', () => {
+  it('maps zero offset at the document boundary to the first inline text position', () => {
+    const document = schema.node('doc', null, [paragraph('开头'), paragraph('第二段')]);
+    const position = positionAtTextOffset(document, 0, document.content.size, 0);
+    expect(position).toBe(1);
+    expect(document.resolve(position!).parent.inlineContent).toBe(true);
+  });
+
   it('maps a text offset through multiple ProseMirror blocks', () => {
     const document = schema.node('doc', null, [paragraph('第一段'), paragraph('这里非常的安静')]);
     const fullText = document.textBetween(0, document.content.size, '\n');

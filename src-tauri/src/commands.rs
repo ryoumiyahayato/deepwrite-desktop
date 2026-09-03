@@ -332,10 +332,10 @@ fn recovery_key_from_path(path: &Path) -> Option<String> {
 }
 
 #[tauri::command]
-pub fn read_recovery(app: AppHandle) -> Result<Option<RecoveryPayload>, String> {
+pub fn read_recovery_candidates(app: AppHandle) -> Result<Vec<RecoveryPayload>, String> {
     let directory = recovery_dir(&app)?;
     if !directory.exists() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     let mut candidates: Vec<(SystemTime, PathBuf)> = fs::read_dir(&directory)
@@ -356,6 +356,7 @@ pub fn read_recovery(app: AppHandle) -> Result<Option<RecoveryPayload>, String> 
         .collect();
     candidates.sort_by(|left, right| right.0.cmp(&left.0));
 
+    let mut recoveries = Vec::new();
     for (_, path) in candidates {
         if let Ok(contents) = fs::read_to_string(&path) {
             if let Some(document_id) = recovery_document_id(&contents) {
@@ -364,12 +365,12 @@ pub fn read_recovery(app: AppHandle) -> Result<Option<RecoveryPayload>, String> 
                         .then_some(document_id)
                 });
                 if let Some(key) = key {
-                    return Ok(Some(RecoveryPayload { key, contents }));
+                    recoveries.push(RecoveryPayload { key, contents });
                 }
             }
         }
     }
-    Ok(None)
+    Ok(recoveries)
 }
 
 #[tauri::command]

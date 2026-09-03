@@ -34,6 +34,13 @@ describe('AI response validation and concurrency protection', () => {
     });
     expect(attachSuggestionContext(duplicate, duplicateContext)[0].relativeFrom).toBeNull();
 
+    const overlappingContext = createSuggestionContext('doc-1', 1, 1, 4, '哈哈哈');
+    const overlapping = aiResponseSchema.parse({
+      ...validResponse,
+      suggestions: [{ ...validResponse.suggestions[0], original: '哈哈' }]
+    });
+    expect(attachSuggestionContext(overlapping, overlappingContext)[0].relativeFrom).toBeNull();
+
     const multilineContext = createSuggestionContext('doc-1', 1, 1, 20, '第一段\n第二段');
     const multiline = aiResponseSchema.parse({
       ...validResponse,

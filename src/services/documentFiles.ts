@@ -135,10 +135,19 @@ export async function writeRecovery(document: DeepWriteDocument, path: string | 
   });
 }
 
+export function firstValidRecovery(payloads: RecoveryPayload[]): RecoveredDwrite | null {
+  for (const payload of payloads) {
+    try {
+      return { key: payload.key, document: parseDocument(payload.contents) };
+    } catch {
+      // A corrupt or future-schema recovery must not hide an older valid candidate.
+    }
+  }
+  return null;
+}
+
 export async function readRecovery(): Promise<RecoveredDwrite | null> {
-  const payload = await invokeCommand<RecoveryPayload | null>('read_recovery');
-  if (!payload) return null;
-  return { key: payload.key, document: parseDocument(payload.contents) };
+  return firstValidRecovery(await invokeCommand<RecoveryPayload[]>('read_recovery_candidates'));
 }
 
 export async function clearRecovery(documentId: string, path: string | null): Promise<void> {

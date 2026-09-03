@@ -12,6 +12,7 @@ import { OutlinePanel } from './components/OutlinePanel';
 import { StatusBar } from './components/StatusBar';
 import { Toolbar } from './components/Toolbar';
 import { createSuggestionContext, isSuggestionStale, stableHash, type AISuggestion, type SuggestionContext } from './domain/ai';
+import { PersistenceQueue } from './domain/persistenceQueue';
 import { SessionGeneration } from './domain/sessionGeneration';
 import { buildVersionRecord } from './domain/versionHistory';
 import { documentInstanceKey } from './domain/documentIdentity';
@@ -93,11 +94,17 @@ export default function App() {
   const pendingOpenDrainRequestedRef = useRef(false);
   const pendingOpenDrainActiveRef = useRef(false);
   const sessionGenerationRef = useRef(new SessionGeneration());
+  const persistenceQueueRef = useRef(new PersistenceQueue());
 
   useEffect(() => { documentRef.current = document; }, [document]);
   useEffect(() => { pathRef.current = path; }, [path]);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
   useEffect(() => { saveStateRef.current = saveState; }, [saveState]);
+
+  const updateSaveState = useCallback((next: SaveState) => {
+    saveStateRef.current = next;
+    setSaveState(next);
+  }, []);
 
   const editor = useEditor({
     extensions: editorExtensions,
@@ -108,7 +115,7 @@ export default function App() {
       if (loadingRef.current) return;
       sessionGenerationRef.current.bump();
       setDocument((current) => ({ ...current, content: activeEditor.getJSON(), updatedAt: new Date().toISOString(), revision: current.revision + 1 }));
-      setSaveState('unsaved');
+      updateSaveState('unsaved');
     }
   });
 
@@ -138,70 +145,87 @@ export default function App() {
 
   useEffect(() => {
     if (document.revision === 0) return;
-    const timer = window.setTimeout(async () => {
+    const timer = window.setTimeout(() => {
       const current = documentRef.current;
+      const currentPath = pathRef.current;
       const generation = sessionGenerationRef.current.current();
-      try {
-        await writeRecovery(current, pathRef.current);
-        if (settingsRef.current.general.autosaveEnabled && pathRef.current) {
-          setSaveState('saving');
-          await saveDwrite(current, pathRef.current, false, settingsRef.current.general.defaultSaveDirectory);
-          const stillCurrent = documentRef.current.id === current.id && sessionGenerationRef.current.isCurrent(generation);
-          if (stillCurrent) {
-            setSaveState('saved');
-            await clearRecovery(current.id, pathRef.current);
-          } else {
-            setSaveState('unsaved');
+      void persistenceQueueRef.current.run(async () => {
+        if (documentRef.current.id !== current.id || !sessionGenerationRef.current.isCurrent(generation)) return;
+        try {
+          await writeRecovery(current, currentPath);
+          if (settingsRef.current.general.autosaveEnabled && currentPath) {
+            updateSaveState('saving');
+            await saveDwrite(current, currentPath, false, settingsRef.current.general.defaultSaveDirectory);
+            const stillCurrent = documentRef.current.id === current.id && sessionGenerationRef.current.isCurrent(generation);
+            if (stillCurrent) {
+              await clearRecovery(current.id, currentPath);
+              if (documentRef.current.id === current.id && sessionGenerationRef.current.isCurrent(generation)) updateSaveState('saved');
+              else {
+                updateSaveState('unsaved');
+                await writeRecovery(documentRef.current, pathRef.current);
+              }
+            } else {
+              updateSaveState('unsaved');
+            }
           }
+        } catch (caught) {
+          updateSaveState('error');
+          setError(`自动保存失败：${String(caught)}`);
         }
-      } catch (caught) { setSaveState('error'); setError(`自动保存失败：${String(caught)}`); }
+      });
     }, 1500);
     return () => window.clearTimeout(timer);
-  }, [document.revision]);
+  }, [document.revision, updateSaveState]);
 
-  const snapshot = useCallback(async (reason: string, source = documentRef.current) => {
-    const record = buildVersionRecord(source, pathRef.current, reason);
+  const snapshot = useCallback(async (reason: string, source = documentRef.current, snapshotPath = pathRef.current) => {
+    const record = buildVersionRecord(source, snapshotPath, reason);
     await createVersion(record, settingsRef.current.general.versionHistoryLimit);
     return record;
   }, []);
 
-  const manualSave = useCallback(async (saveAs = false): Promise<boolean> => {
-    if (!editor) return false;
-    const source = { ...documentRef.current, content: editor.getJSON(), updatedAt: new Date().toISOString() };
-    const sourcePath = pathRef.current;
-    const generation = sessionGenerationRef.current.current();
-    setSaveState('saving');
-    try {
-      const saved = await saveDwrite(source, sourcePath, saveAs, settingsRef.current.general.defaultSaveDirectory);
-      if (!saved) { setSaveState('unsaved'); return false; }
-      const stillCurrent = documentRef.current.id === source.id && sessionGenerationRef.current.isCurrent(generation);
-      await addRecentFile(saved.path, saved.document.title, settingsRef.current.general.recentFilesLimit);
-      await refreshRecent();
-      if (!stillCurrent) {
-        setSaveState('unsaved');
-        return false;
+  const manualSave = useCallback((saveAs = false): Promise<boolean> => {
+    if (!editor) return Promise.resolve(false);
+    return persistenceQueueRef.current.run(async () => {
+      const source = { ...documentRef.current, content: editor.getJSON(), updatedAt: new Date().toISOString() };
+      const sourcePath = pathRef.current;
+      const generation = sessionGenerationRef.current.current();
+      updateSaveState('saving');
+      try {
+        const saved = await saveDwrite(source, sourcePath, saveAs, settingsRef.current.general.defaultSaveDirectory);
+        if (!saved) { updateSaveState('unsaved'); return false; }
+        await addRecentFile(saved.path, saved.document.title, settingsRef.current.general.recentFilesLimit);
+        await refreshRecent();
+        try { await snapshot('手动保存', saved.document, saved.path); }
+        catch (historyError) { setError(`文档已保存，但版本快照失败：${String(historyError)}`); }
+        await clearRecovery(source.id, sourcePath);
+
+        const stillCurrent = documentRef.current.id === source.id && sessionGenerationRef.current.isCurrent(generation);
+        if (!stillCurrent) {
+          updateSaveState('unsaved');
+          try { await writeRecovery(documentRef.current, pathRef.current); } catch { /* unsaved guard remains authoritative */ }
+          return false;
+        }
+
+        const identityChanged = saved.document.id !== source.id;
+        pathRef.current = saved.path;
+        setPath(saved.path);
+        if (identityChanged) sessionGenerationRef.current.reset();
+        documentRef.current = saved.document;
+        setDocument(saved.document);
+        updateSaveState('saved');
+        if (identityChanged) {
+          setSuggestions([]); setContinuation(null); setAISummary(''); editor.commands.setAiSuggestionDecorations([]);
+        }
+        return true;
+      } catch (caught) {
+        try { await writeRecovery(source, sourcePath); } catch { /* keep the original save error */ }
+        updateSaveState('error'); setError(`保存失败：${String(caught)}`); return false;
       }
-      pathRef.current = saved.path;
-      setPath(saved.path);
-      try { await snapshot('手动保存', saved.document); }
-      catch (historyError) { setError(`文档已保存，但版本快照失败：${String(historyError)}`); }
-      const identityChanged = saved.document.id !== source.id;
-      if (identityChanged) sessionGenerationRef.current.reset();
-      documentRef.current = saved.document;
-      setDocument(saved.document);
-      setSaveState('saved');
-      await clearRecovery(source.id, sourcePath);
-      if (identityChanged) {
-        setSuggestions([]); setContinuation(null); setAISummary(''); editor.commands.setAiSuggestionDecorations([]);
-      }
-      return true;
-    } catch (caught) {
-      try { await writeRecovery(source, sourcePath); } catch { /* keep the original save error */ }
-      setSaveState('error'); setError(`保存失败：${String(caught)}`); return false;
-    }
-  }, [editor, refreshRecent, snapshot]);
+    });
+  }, [editor, refreshRecent, snapshot, updateSaveState]);
 
   const prepareDocumentTransition = useCallback(async (): Promise<TransitionDecision> => {
+    await persistenceQueueRef.current.waitForIdle();
     if (!needsDocumentTransitionGuard(saveStateRef.current)) return 'proceed';
     const saveFirst = window.confirm('当前文档有尚未确认写入磁盘的修改。\n\n确定：先保存并继续。\n取消：选择是否放弃这些修改。');
     if (saveFirst) return await manualSave(false) ? 'proceed' : 'cancel';
@@ -248,19 +272,19 @@ export default function App() {
       if (loaded.kind === 'document') {
         editor.commands.setContent(loaded.document.content, { emitUpdate: false });
         sessionGenerationRef.current.reset(); documentRef.current = loaded.document; pathRef.current = loaded.path;
-        setDocument(loaded.document); setPath(loaded.path); setSaveState('saved');
+        setDocument(loaded.document); setPath(loaded.path); updateSaveState('saved');
         await addRecentFile(loaded.path, loaded.document.title, settingsRef.current.general.recentFilesLimit);
       } else {
         editor.commands.setContent(loaded.html, { emitUpdate: false });
         const imported = { ...createDocument(loaded.title), content: editor.getJSON(), revision: 1, metadata: { importedFrom: loaded.sourcePath, importedAt: new Date().toISOString() } };
         sessionGenerationRef.current.reset(); documentRef.current = imported; pathRef.current = null;
-        setDocument(imported); setPath(null); setSaveState('unsaved');
+        setDocument(imported); setPath(null); updateSaveState('unsaved');
         if (loaded.warnings.length) setError(`导入完成，含 ${loaded.warnings.length} 条兼容性提示：${loaded.warnings[0]}`);
       }
       setSuggestions([]); setContinuation(null); setAISummary(''); editor.commands.setAiSuggestionDecorations([]);
       await refreshRecent();
     } finally { loadingRef.current = false; }
-  }, [editor, refreshRecent]);
+  }, [editor, refreshRecent, updateSaveState]);
 
   useEffect(() => {
     if (!editor || !isTauri() || startupOpenAttemptedRef.current) return;
@@ -355,10 +379,10 @@ export default function App() {
     editor.commands.setContent(created.content, { emitUpdate: false });
     loadingRef.current = false;
     sessionGenerationRef.current.reset(); documentRef.current = created; pathRef.current = null;
-    setDocument(created); setPath(null); setSaveState('unsaved'); setSuggestions([]); setContinuation(null); setAISummary('');
+    setDocument(created); setPath(null); updateSaveState('unsaved'); setSuggestions([]); setContinuation(null); setAISummary('');
     editor.commands.setAiSuggestionDecorations([]);
     await commitDiscard(decision, previousDocumentId, previousPath);
-  }, [commitDiscard, editor, prepareDocumentTransition]);
+  }, [commitDiscard, editor, prepareDocumentTransition, updateSaveState]);
 
   const runExport = useCallback(async (format: 'docx' | 'txt' | 'md' | 'html') => {
     if (!editor) return;
@@ -473,7 +497,13 @@ export default function App() {
       syncSuggestions(suggestions.map((item) => item.id === id ? { ...item, status: 'stale' } : item)); return;
     }
     try {
+      const generation = sessionGenerationRef.current.current();
       await snapshot('执行 AI 替换前');
+      const currentAfterSnapshot = editor.state.doc.textBetween(suggestion.targetFrom, suggestion.targetTo, '\n');
+      if (!sessionGenerationRef.current.isCurrent(generation) || isSuggestionStale(suggestion, currentAfterSnapshot, documentRef.current.id, documentRef.current.revision)) {
+        syncSuggestions(suggestions.map((item) => item.id === id ? { ...item, status: 'stale' } : item));
+        return;
+      }
       editor.chain().focus().insertContentAt({ from: suggestion.targetFrom, to: suggestion.targetTo }, suggestion.replacement).run();
       syncSuggestions(suggestions.map((item) => item.id === id ? { ...item, status: 'accepted' } : item.status === 'pending' ? { ...item, status: 'stale' } : item));
     } catch (caught) { setError(`接受建议失败：${String(caught)}`); }
@@ -483,8 +513,14 @@ export default function App() {
     if (!editor) return;
     const pending = suggestions.filter((item) => item.status === 'pending' && item.targetFrom !== null && item.targetTo !== null).sort((a, b) => (b.targetFrom ?? 0) - (a.targetFrom ?? 0));
     if (!pending.length) return;
+    const originalDocumentId = documentRef.current.id;
     const originalRevision = documentRef.current.revision;
+    const generation = sessionGenerationRef.current.current();
     await snapshot('批量接受 AI 修改前');
+    if (documentRef.current.id !== originalDocumentId || !sessionGenerationRef.current.isCurrent(generation)) {
+      syncSuggestions(suggestions.map((item) => item.status === 'pending' ? { ...item, status: 'stale' } : item));
+      return;
+    }
     const statuses = new Map<string, AISuggestion['status']>();
     for (const suggestion of pending) {
       const current = editor.state.doc.textBetween(suggestion.targetFrom!, suggestion.targetTo!, '\n');
@@ -508,7 +544,16 @@ export default function App() {
       if (insertionPosition < 1 || insertionPosition > editor.state.doc.content.size) {
         throw new Error('续写的原始插入位置已经无效，请重新生成。');
       }
+      const generation = sessionGenerationRef.current.current();
       await snapshot('插入 AI 续写前');
+      if (
+        !sessionGenerationRef.current.isCurrent(generation) ||
+        continuation.context.documentId !== documentRef.current.id ||
+        continuation.context.documentRevision !== documentRef.current.revision
+      ) {
+        setError('创建版本快照期间原文已经变化。为避免把旧上下文续写插入新版本，请重新生成。');
+        return;
+      }
       const paragraphs = continuation.text.split(/\n+/).map((value) => value.trim()).filter(Boolean).map((value) => ({ type: 'paragraph', content: [{ type: 'text', text: value }] }));
       if (!paragraphs.length) return;
       editor.chain().focus().setTextSelection(insertionPosition).insertContent(paragraphs).run();
@@ -574,8 +619,8 @@ export default function App() {
     editor.commands.setContent(version.snapshot.content, { emitUpdate: false }); loadingRef.current = false;
     const restored = { ...version.snapshot, updatedAt: new Date().toISOString(), revision: documentRef.current.revision + 1 };
     sessionGenerationRef.current.bump(); documentRef.current = restored; setDocument(restored);
-    setSaveState('unsaved'); setHistoryOpen(false); setSuggestions([]); setContinuation(null); editor.commands.setAiSuggestionDecorations([]);
-  }, [editor, snapshot]);
+    updateSaveState('unsaved'); setHistoryOpen(false); setSuggestions([]); setContinuation(null); editor.commands.setAiSuggestionDecorations([]);
+  }, [editor, snapshot, updateSaveState]);
 
   const saveAppSettings = useCallback(async (next: AppSettings) => { await saveSettings(next); setSettingsState(next); await refreshRecent(next.general.recentFilesLimit); }, [refreshRecent]);
 
@@ -604,7 +649,7 @@ export default function App() {
   const outline = extractOutline(document.content);
 
   return <div className="app-shell">
-    <div className="document-title-row"><FileText /><input value={document.title} aria-label="文档标题" onChange={(event) => { const title = event.target.value; sessionGenerationRef.current.bump(); setDocument((current) => ({ ...current, title, updatedAt: new Date().toISOString(), revision: current.revision + 1 })); setSaveState('unsaved'); }} /><span>{path ?? '尚未保存为 .dwrite'}</span><button onClick={() => setOutlineCollapsed((value) => !value)} title="切换章节大纲"><PanelLeftClose /></button><button onClick={() => setAICollapsed((value) => !value)} title="切换 AI 面板"><PanelRightClose /></button></div>
+    <div className="document-title-row"><FileText /><input value={document.title} aria-label="文档标题" onChange={(event) => { const title = event.target.value; sessionGenerationRef.current.bump(); setDocument((current) => ({ ...current, title, updatedAt: new Date().toISOString(), revision: current.revision + 1 })); updateSaveState('unsaved'); }} /><span>{path ?? '尚未保存为 .dwrite'}</span><button onClick={() => setOutlineCollapsed((value) => !value)} title="切换章节大纲"><PanelLeftClose /></button><button onClick={() => setAICollapsed((value) => !value)} title="切换 AI 面板"><PanelRightClose /></button></div>
     <MenuBar actions={menuActions} />
     <Toolbar key={`${settings.editor.defaultFont}-${settings.editor.defaultFontSize}-${settings.editor.defaultLineHeight}`} editor={editor} defaults={settings.editor} onInsertImage={() => void insertImage()} />
     <div className="workspace-grid">
@@ -616,7 +661,7 @@ export default function App() {
     {settingsOpen ? <SettingsDialog initial={settings} hasKey={storedKey} onClose={() => setSettingsOpen(false)} onSave={saveAppSettings} onSaveKey={async (key) => { await saveDeepSeekKey(key); setStoredKey(true); }} onDeleteKey={async () => { await deleteDeepSeekKey(); setStoredKey(false); }} onTest={testDeepSeekConnection} /> : null}
     {findMode ? <FindReplaceDialog replaceMode={findMode === 'replace'} onClose={() => setFindMode(null)} onFind={findText} onReplace={replaceText} onReplaceAll={replaceAll} /> : null}
     {historyOpen ? <HistoryDialog versions={versions} onClose={() => setHistoryOpen(false)} onRestore={(version) => void restoreVersion(version)} onClear={() => void clearHistory()} /> : null}
-    {recovery ? <RecoveryDialog document={recovery.document} onRestore={() => { const recovered = recovery; if (editor) { loadingRef.current = true; editor.commands.setContent(recovered.document.content, { emitUpdate: false }); loadingRef.current = false; editor.commands.setAiSuggestionDecorations([]); } sessionGenerationRef.current.reset(); documentRef.current = recovered.document; pathRef.current = null; setDocument(recovered.document); setPath(null); setSaveState('unsaved'); setSuggestions([]); setContinuation(null); setAISummary(''); setRecovery(null); const restoredKey = documentInstanceKey(recovered.document.id, null); void writeRecovery(recovered.document, null).then(() => recovered.key === restoredKey ? undefined : clearRecoveryKey(recovered.key)).catch((caught) => setError(`迁移恢复内容失败：${String(caught)}`)); }} onDiscard={() => { const discarded = recovery; void clearRecoveryKey(discarded.key).then(() => readRecovery()).then(setRecovery).catch((caught) => { setRecovery(null); setError(`清理恢复内容失败：${String(caught)}`); }); }} /> : null}
+    {recovery ? <RecoveryDialog document={recovery.document} onRestore={() => { const recovered = recovery; if (editor) { loadingRef.current = true; editor.commands.setContent(recovered.document.content, { emitUpdate: false }); loadingRef.current = false; editor.commands.setAiSuggestionDecorations([]); } sessionGenerationRef.current.reset(); documentRef.current = recovered.document; pathRef.current = null; setDocument(recovered.document); setPath(null); updateSaveState('unsaved'); setSuggestions([]); setContinuation(null); setAISummary(''); setRecovery(null); const restoredKey = documentInstanceKey(recovered.document.id, null); void writeRecovery(recovered.document, null).then(() => recovered.key === restoredKey ? undefined : clearRecoveryKey(recovered.key)).catch((caught) => setError(`迁移恢复内容失败：${String(caught)}`)); }} onDiscard={() => { const discarded = recovery; void clearRecoveryKey(discarded.key).then(() => readRecovery()).then(setRecovery).catch((caught) => { setRecovery(null); setError(`清理恢复内容失败：${String(caught)}`); }); }} /> : null}
     {error ? <ErrorNotice message={error} onClose={() => setError('')} /> : null}
   </div>;
 }

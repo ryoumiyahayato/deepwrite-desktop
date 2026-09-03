@@ -57,14 +57,33 @@ async function garbageCollectHistoryAssets(database: Database): Promise<void> {
   );
 }
 
+async function prunePersistedVersionHistory(limit: number): Promise<void> {
+  if (!isTauri() || limit <= 0) return;
+  const database = await db();
+  await database.execute(`
+    DELETE FROM versions WHERE id IN (
+      SELECT id FROM (
+        SELECT id, ROW_NUMBER() OVER (
+          PARTITION BY document_id ORDER BY created_at DESC, id DESC
+        ) AS row_number
+        FROM versions
+      ) WHERE row_number > $1
+    )
+  `, [limit]);
+  await garbageCollectHistoryAssets(database);
+}
+
 export async function loadSettings(): Promise<AppSettings> {
   if (!isTauri()) {
     const value = localStorage.getItem('deepwrite.settings');
     return value ? settingsSchema.catch(defaultSettings).parse(JSON.parse(value)) : structuredClone(defaultSettings);
   }
   const rows = await (await db()).select<Array<{ value: string }>>('SELECT value FROM settings WHERE key = $1', ['app']);
-  if (!rows[0]) return structuredClone(defaultSettings);
-  return settingsSchema.catch(defaultSettings).parse(JSON.parse(rows[0].value));
+  const settings = rows[0]
+    ? settingsSchema.catch(defaultSettings).parse(JSON.parse(rows[0].value))
+    : structuredClone(defaultSettings);
+  await prunePersistedVersionHistory(settings.general.versionHistoryLimit);
+  return settings;
 }
 
 export async function saveSettings(settings: AppSettings): Promise<void> {

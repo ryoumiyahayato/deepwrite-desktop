@@ -5,8 +5,9 @@ This file records the release-critical invariants established by the Phase 1 har
 ## Document lifecycle
 
 - New, Open, Open Recent, external `.dwrite` handoff, and window close must not replace a dirty or failed-save document without an explicit Save / Discard / Cancel decision.
-- Autosave completion may mark the UI saved or clear recovery only when it still belongs to the current document session generation.
-- Crash recovery is document/path aware rather than a single global recovery slot.
+- Autosave and manual saves are serialized. Document replacement waits for in-flight persistence before offering discard, and save completion may mark the UI saved or clear recovery only when it still belongs to the current document session generation.
+- Crash recovery is document/path aware rather than a single global recovery slot; corrupt or future-schema candidates are skipped so they cannot hide an older valid recovery.
+- Positive version-history retention is enforced across legacy document histories at startup, not only after a document creates a new snapshot.
 - Saving an existing `.dwrite` is compare-and-swap guarded against external modification.
 
 ## AI authority and privacy

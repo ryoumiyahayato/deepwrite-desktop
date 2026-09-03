@@ -80,7 +80,7 @@ function uniqueOffset(haystack: string, needle: string): number | null {
   if (!needle || needle.includes('\n')) return null;
   const first = haystack.indexOf(needle);
   if (first < 0) return null;
-  const second = haystack.indexOf(needle, first + Math.max(1, needle.length));
+  const second = haystack.indexOf(needle, first + 1);
   return second < 0 ? first : null;
 }
 

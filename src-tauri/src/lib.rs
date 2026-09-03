@@ -99,7 +99,7 @@ pub fn run() {
             commands::startup_document_path,
             commands::take_pending_open_documents,
             commands::write_recovery,
-            commands::read_recovery,
+            commands::read_recovery_candidates,
             commands::clear_recovery,
             commands::vault_password,
             commands::test_deepseek,
