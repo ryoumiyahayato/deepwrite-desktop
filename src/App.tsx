@@ -40,7 +40,7 @@ import {
   type VersionRecord
 } from './services/database';
 import { isDiagnosticTask, requestSuggestions, testDeepSeekConnection, type AITask } from './services/deepseek';
-import { requestFullDocumentDiagnosis } from './services/diagnostics';
+import { buildFullDocumentDiagnosticPlan, requestFullDocumentDiagnosis } from './services/diagnostics';
 import {
   chooseAndOpenDocument,
   clearRecovery,
@@ -50,6 +50,7 @@ import {
   readRecovery,
   saveDwrite,
   startupDocumentPath,
+  takePendingOpenDocuments,
   writeRecovery,
   type ImportedContent,
   type RecoveredDwrite
@@ -89,6 +90,8 @@ export default function App() {
   const saveStateRef = useRef(saveState);
   const lastAutoHash = useRef<string | null>(null);
   const startupOpenAttemptedRef = useRef(false);
+  const pendingOpenDrainRequestedRef = useRef(false);
+  const pendingOpenDrainActiveRef = useRef(false);
   const sessionGenerationRef = useRef(new SessionGeneration());
 
   useEffect(() => { documentRef.current = document; }, [document]);
@@ -270,18 +273,50 @@ export default function App() {
 
   useEffect(() => {
     if (!editor || !isTauri()) return;
+    let disposed = false;
     let unlisten: (() => void) | undefined;
-    void listen<string>('deepwrite://open-document', (event) => {
-      void (async () => {
-        const decision = await prepareDocumentTransition();
-        if (decision === 'cancel') return;
-        const previousDocumentId = documentRef.current.id;
-        const previousPath = pathRef.current;
-        await applyLoaded(await openDocumentAtPath(event.payload));
-        await commitDiscard(decision, previousDocumentId, previousPath);
-      })().catch((caught) => setError(`无法打开来自第二实例的文档：${String(caught)}`));
-    }).then((dispose) => { unlisten = dispose; });
-    return () => { unlisten?.(); };
+
+    const drainPendingOpenDocuments = async () => {
+      pendingOpenDrainRequestedRef.current = true;
+      if (pendingOpenDrainActiveRef.current || disposed) return;
+      pendingOpenDrainActiveRef.current = true;
+      try {
+        while (pendingOpenDrainRequestedRef.current && !disposed) {
+          pendingOpenDrainRequestedRef.current = false;
+          const pendingPaths = await takePendingOpenDocuments();
+          for (const pendingPath of pendingPaths) {
+            if (disposed) return;
+            const decision = await prepareDocumentTransition();
+            if (decision === 'cancel') return;
+            const previousDocumentId = documentRef.current.id;
+            const previousPath = pathRef.current;
+            await applyLoaded(await openDocumentAtPath(pendingPath));
+            await commitDiscard(decision, previousDocumentId, previousPath);
+          }
+        }
+      } catch (caught) {
+        setError(`无法打开来自第二实例的文档：${String(caught)}`);
+      } finally {
+        pendingOpenDrainActiveRef.current = false;
+        if (pendingOpenDrainRequestedRef.current && !disposed) void drainPendingOpenDocuments();
+      }
+    };
+
+    void listen<void>('deepwrite://pending-open-documents', () => {
+      void drainPendingOpenDocuments();
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+        return;
+      }
+      unlisten = dispose;
+      void drainPendingOpenDocuments();
+    }).catch((caught) => setError(`无法建立第二实例文件交接监听：${String(caught)}`));
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
   }, [applyLoaded, commitDiscard, editor, prepareDocumentTransition]);
 
   const openFile = useCallback(async () => {
@@ -369,12 +404,15 @@ export default function App() {
     const chapterSummary = outlineText.length > 2000 ? `${outlineText.slice(0, 2000)}…` : outlineText;
     const fullText = editor.getText({ blockSeparator: '\n' });
     const evidenceBudget = Math.max(1200, max - selected.length - (flankLimit * 2));
+    const diagnosticPlan = isDiagnosticTask(task) ? buildFullDocumentDiagnosticPlan(fullText, evidenceBudget) : null;
+    if (diagnosticPlan && !window.confirm(diagnosticPlan.disclosure.message)) return;
     setAIState('running'); setAICollapsed(false);
     if (task !== 'continue') setContinuation(null);
     try {
       if (isDiagnosticTask(task)) {
+        if (!diagnosticPlan) throw new Error('无法建立全文诊断计划。');
         const summary = await requestFullDocumentDiagnosis({
-          task, fullText, evidenceBudget,
+          task, fullText, evidenceBudget, plan: diagnosticPlan,
           baseContext: { selected, before, after, chapterSummary, authorRules: settingsRef.current.ai.authorRules, customInstruction },
           settings: settingsRef.current, context,
           isCurrent: () => documentRef.current.id === context.documentId && documentRef.current.revision === context.documentRevision

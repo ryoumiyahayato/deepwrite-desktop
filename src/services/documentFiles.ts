@@ -153,6 +153,10 @@ export async function startupDocumentPath(): Promise<string | null> {
   return invokeCommand<string | null>('startup_document_path');
 }
 
+export async function takePendingOpenDocuments(): Promise<string[]> {
+  return invokeCommand<string[]>('take_pending_open_documents');
+}
+
 export function importedHtmlDocument(title: string, content: JSONContent): DeepWriteDocument {
   return { ...createDocument(title), content, revision: 1, metadata: { importedAt: new Date().toISOString() } };
 }

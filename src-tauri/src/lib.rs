@@ -53,12 +53,18 @@ fn migrations() -> Vec<Migration> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut builder = tauri::Builder::default();
+    let mut builder = tauri::Builder::default().manage(commands::PendingOpenDocuments::default());
     #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
             if let Some(path) = commands::dwrite_path_from_arguments(args.into_iter().skip(1)) {
-                let _ = app.emit("deepwrite://open-document", path);
+                if app
+                    .state::<commands::PendingOpenDocuments>()
+                    .push(path)
+                    .is_ok()
+                {
+                    let _ = app.emit("deepwrite://pending-open-documents", ());
+                }
             }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -79,9 +85,8 @@ pub fn run() {
             let local_data = app.path().app_local_data_dir()?;
             std::fs::create_dir_all(&local_data)?;
             let salt_path = local_data.join("stronghold.salt");
-            app.handle().plugin(
-                tauri_plugin_stronghold::Builder::with_argon2(&salt_path).build(),
-            )?;
+            app.handle()
+                .plugin(tauri_plugin_stronghold::Builder::with_argon2(&salt_path).build())?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -92,6 +97,7 @@ pub fn run() {
             commands::read_text_if_exists,
             commands::read_binary,
             commands::startup_document_path,
+            commands::take_pending_open_documents,
             commands::write_recovery,
             commands::read_recovery,
             commands::clear_recovery,

@@ -1,10 +1,12 @@
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Manager};
 use uuid::Uuid;
@@ -12,6 +14,29 @@ use uuid::Uuid;
 const DEEPSEEK_ENDPOINT: &str = "https://api.deepseek.com/chat/completions";
 const KEYRING_SERVICE: &str = "com.deepwrite.desktop";
 const KEYRING_USER: &str = "stronghold-master-password";
+
+#[derive(Default)]
+pub struct PendingOpenDocuments {
+    queue: Mutex<VecDeque<String>>,
+}
+
+impl PendingOpenDocuments {
+    pub(crate) fn push(&self, path: String) -> Result<(), String> {
+        self.queue
+            .lock()
+            .map_err(|_| "待打开文档队列不可用".to_string())?
+            .push_back(path);
+        Ok(())
+    }
+
+    fn drain(&self) -> Result<Vec<String>, String> {
+        let mut queue = self
+            .queue
+            .lock()
+            .map_err(|_| "待打开文档队列不可用".to_string())?;
+        Ok(queue.drain(..).collect())
+    }
+}
 
 fn safe_error(context: &str, error: impl std::fmt::Display) -> String {
     let detail = error.to_string();
@@ -31,12 +56,23 @@ fn replace_file(temp: &Path, destination: &Path, replace_existing: bool) -> Resu
     };
 
     let from: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
-    let to: Vec<u16> = destination.as_os_str().encode_wide().chain(Some(0)).collect();
+    let to: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     let flags = MOVEFILE_WRITE_THROUGH
-        | if replace_existing { MOVEFILE_REPLACE_EXISTING } else { 0 };
+        | if replace_existing {
+            MOVEFILE_REPLACE_EXISTING
+        } else {
+            0
+        };
     let ok = unsafe { MoveFileExW(from.as_ptr(), to.as_ptr(), flags) };
     if ok == 0 {
-        Err(safe_error("无法安全替换文件", std::io::Error::last_os_error()))
+        Err(safe_error(
+            "无法安全替换文件",
+            std::io::Error::last_os_error(),
+        ))
     } else {
         Ok(())
     }
@@ -54,7 +90,9 @@ fn replace_file(temp: &Path, destination: &Path, replace_existing: bool) -> Resu
 }
 
 fn prepare_temp_file(path: &Path, data: &[u8]) -> Result<PathBuf, String> {
-    let parent = path.parent().ok_or_else(|| "目标路径没有父目录".to_string())?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "目标路径没有父目录".to_string())?;
     fs::create_dir_all(parent).map_err(|e| safe_error("无法创建目录", e))?;
     let file_name = path
         .file_name()
@@ -63,8 +101,10 @@ fn prepare_temp_file(path: &Path, data: &[u8]) -> Result<PathBuf, String> {
     let temp = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
     let result = (|| {
         let mut file = File::create(&temp).map_err(|e| safe_error("无法创建临时文件", e))?;
-        file.write_all(data).map_err(|e| safe_error("无法写入临时文件", e))?;
-        file.sync_all().map_err(|e| safe_error("无法同步临时文件", e))?;
+        file.write_all(data)
+            .map_err(|e| safe_error("无法写入临时文件", e))?;
+        file.sync_all()
+            .map_err(|e| safe_error("无法同步临时文件", e))?;
         Ok::<(), String>(())
     })();
     if result.is_err() {
@@ -152,22 +192,30 @@ fn compare_and_swap_text_path(
             let current = match fs::read_to_string(&path) {
                 Ok(value) => value,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(save_conflict("磁盘文件已被删除或移动，请重新打开或另存为。"));
+                    return Err(save_conflict(
+                        "磁盘文件已被删除或移动，请重新打开或另存为。",
+                    ));
                 }
                 Err(error) => return Err(safe_error("无法读取目标文件进行冲突检查", error)),
             };
             if current != expected {
-                return Err(save_conflict("磁盘文件自上次读取后已被其他实例或程序修改；DeepWrite 未覆盖这些外部修改。"));
+                return Err(save_conflict(
+                    "磁盘文件自上次读取后已被其他实例或程序修改；DeepWrite 未覆盖这些外部修改。",
+                ));
             }
             return replace_file(&temp, &path, true);
         }
 
         if path.exists() {
-            return Err(save_conflict("目标文件在保存前已被创建或替换，请重新选择保存位置。"));
+            return Err(save_conflict(
+                "目标文件在保存前已被创建或替换，请重新选择保存位置。",
+            ));
         }
         match replace_file(&temp, &path, false) {
             Ok(()) => Ok(()),
-            Err(_) if path.exists() => Err(save_conflict("目标文件在保存过程中已被其他实例或程序创建；DeepWrite 未覆盖该文件。")),
+            Err(_) if path.exists() => Err(save_conflict(
+                "目标文件在保存过程中已被其他实例或程序创建；DeepWrite 未覆盖该文件。",
+            )),
             Err(error) => Err(error),
         }
     })();
@@ -233,6 +281,13 @@ where
 #[tauri::command]
 pub fn startup_document_path() -> Option<String> {
     dwrite_path_from_arguments(std::env::args_os().skip(1))
+}
+
+#[tauri::command]
+pub fn take_pending_open_documents(
+    pending: tauri::State<'_, PendingOpenDocuments>,
+) -> Result<Vec<String>, String> {
+    pending.drain()
 }
 
 fn recovery_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -390,18 +445,33 @@ async fn response_error(response: reqwest::Response) -> String {
     let body = response.text().await.unwrap_or_default();
     let message = serde_json::from_str::<Value>(&body)
         .ok()
-        .and_then(|value| value.pointer("/error/message").and_then(Value::as_str).map(str::to_owned))
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
         .unwrap_or_else(|| "DeepSeek 返回了错误".to_string());
-    format!("HTTP {}: {}", status.as_u16(), message.chars().take(240).collect::<String>())
+    format!(
+        "HTTP {}: {}",
+        status.as_u16(),
+        message.chars().take(240).collect::<String>()
+    )
 }
 
 #[tauri::command]
 pub async fn test_deepseek(api_key: String, model: String) -> Result<TestResult, String> {
     if api_key.trim().is_empty() {
-        return Ok(TestResult { success: false, message: "请先填写 API Key".into() });
+        return Ok(TestResult {
+            success: false,
+            message: "请先填写 API Key".into(),
+        });
     }
     if !allowed_model(&model) {
-        return Ok(TestResult { success: false, message: "模型名称不在允许列表中".into() });
+        return Ok(TestResult {
+            success: false,
+            message: "模型名称不在允许列表中".into(),
+        });
     }
     let body = serde_json::json!({
         "model": model,
@@ -417,9 +487,15 @@ pub async fn test_deepseek(api_key: String, model: String) -> Result<TestResult,
         .await
         .map_err(|e| safe_error("连接 DeepSeek 失败", e))?;
     if response.status().is_success() {
-        Ok(TestResult { success: true, message: "连接成功".into() })
+        Ok(TestResult {
+            success: true,
+            message: "连接成功".into(),
+        })
     } else {
-        Ok(TestResult { success: false, message: response_error(response).await })
+        Ok(TestResult {
+            success: false,
+            message: response_error(response).await,
+        })
     }
 }
 
@@ -520,5 +596,20 @@ mod tests {
             Some(r"C:\Drafts\novel.dwrite")
         );
         assert!(dwrite_path_from_arguments(vec![std::ffi::OsString::from("notes.md")]).is_none());
+    }
+
+    #[test]
+    fn pending_open_queue_preserves_order_and_drains_atomically() {
+        let pending = PendingOpenDocuments::default();
+        pending.push(r"C:\Drafts\one.dwrite".into()).unwrap();
+        pending.push(r"C:\Drafts\two.dwrite".into()).unwrap();
+        assert_eq!(
+            pending.drain().unwrap(),
+            vec![
+                r"C:\Drafts\one.dwrite".to_string(),
+                r"C:\Drafts\two.dwrite".to_string()
+            ]
+        );
+        assert!(pending.drain().unwrap().is_empty());
     }
 }

@@ -11,6 +11,7 @@ DeepWrite is a local-first Windows desktop application for long-form writing. It
 * Local images: insert data URI images with basic width scaling.
 * Custom page-break nodes that are converted into real page breaks when printing.
 * Windows shortcuts: `Ctrl+N/O/S/Shift+S/Z/Y/F/H/B/I/U`, plus standard cut, copy, paste, and select-all shortcuts.
+* Windows single-instance handoff keeps second-launch `.dwrite` paths in a Rust FIFO until the renderer listener is ready, so an early second launch cannot be lost merely because the UI has not mounted yet.
 * Standalone `.dwrite` JSON documents whose authoritative current content does not depend on SQLite.
 * Safe writes using temporary files in the same directory plus Windows `MoveFileExW` replace/write-through behavior.
 * 1.5-second debounced autosave, per-document crash recovery, recent files, and restorable version history.
@@ -91,7 +92,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
-Tests cover document serialization, rejection of corrupted/future schemas, AI response schemas, exact stale-suggestion handling, ambiguous-anchor rejection, ProseMirror text-offset mapping, document-transition guard states, pause-analysis deduplication, autosave debouncing, recovery filename isolation, and basic DOCX export. GitHub Actions runs the JavaScript/TypeScript checks and Windows Rust checks on pushes and pull requests.
+Tests cover document serialization, rejection of corrupted/future schemas, AI response schemas, exact stale-suggestion handling, ambiguous-anchor rejection, ProseMirror text-offset mapping, document-transition guard states, pause-analysis deduplication, autosave debouncing, recovery filename isolation, full-document diagnostic disclosure/batch identity, pending second-instance FIFO ordering, and basic DOCX export. GitHub Actions runs the JavaScript/TypeScript checks and Windows Rust checks on pushes and pull requests.
 
 ## Production Build
 
@@ -141,9 +142,11 @@ All of these user-data files are excluded by `.gitignore`.
 
 ## Privacy
 
-Articles are stored locally by default. Relevant selections, limited surrounding context, chapter summaries, and author rules are sent to the user-configured DeepSeek API only when the user actively invokes an AI feature or explicitly enables automatic analysis after writing pauses.
+Articles are stored locally by default. Ordinary proofreading, polishing, rewriting, continuation, custom AI actions, and optional pause-analysis send only the relevant selection/recent text plus bounded surrounding context, chapter-title summary data, and author rules to the user-configured DeepSeek API when the feature is invoked. Automatic pause-analysis remains bounded to recent context and does not silently start a full-document diagnosis.
 
-DeepWrite does not, by default, retain request logs containing the full document text and stores no document text in AI suggestion-history payloads. Local version history is different: when enabled, it deliberately retains full historical document snapshots on the user's machine so that older versions can be restored. The retention limit and deletion control are exposed to the user. DeepWrite includes no telemetry and sends no data to the project maintainer.
+The logic-review, contradiction-detection, and character-consistency commands are different: they are full-document diagnostic operations. Before any request is sent, DeepWrite displays a separate confirmation explaining that the entire current document will be split into a specific number of overlapping request batches and sent to the configured DeepSeek API. The exact batch plan shown in that confirmation is the plan used for the diagnostic run. Cancelling the confirmation sends nothing for that run. Each batch can also include author rules, chapter-title summary data, and limited selection/cursor-adjacent context. DeepSeek's handling of received data is governed by the user's API account and DeepSeek's service terms.
+
+DeepWrite itself does not retain AI request bodies as request logs, stores no document text in AI suggestion-history payloads, includes no telemetry, and sends no document data to the project maintainer. Local version history is different: when enabled, it deliberately retains full historical document snapshots on the user's machine so that older versions can be restored. The retention limit and deletion control are exposed to the user.
 
 ## DOCX Compatibility Boundaries
 
