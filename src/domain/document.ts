@@ -1,7 +1,8 @@
 import type { JSONContent } from '@tiptap/core';
 import { z } from 'zod';
 
-export const DWRITE_SCHEMA_VERSION = 1;
+export const DWRITE_SCHEMA_VERSION = 2;
+export const DWRITE_EDITOR_SCHEMA = 'tiptap-json-v1' as const;
 
 export interface DocumentMetadata {
   author?: string;
@@ -13,6 +14,7 @@ export interface DocumentMetadata {
 
 export interface DeepWriteDocument {
   schemaVersion: number;
+  editorSchema: typeof DWRITE_EDITOR_SCHEMA;
   id: string;
   title: string;
   content: JSONContent;
@@ -32,8 +34,20 @@ const jsonContentSchema: z.ZodType<JSONContent> = z.lazy(() =>
   })
 );
 
+const legacyV1Schema = z.object({
+  schemaVersion: z.literal(1),
+  id: z.string().min(1),
+  title: z.string(),
+  content: jsonContentSchema,
+  createdAt: z.string().datetime(),
+  updatedAt: z.string().datetime(),
+  revision: z.number().int().nonnegative(),
+  metadata: z.record(z.string(), z.unknown())
+});
+
 export const deepWriteDocumentSchema: z.ZodType<DeepWriteDocument> = z.object({
-  schemaVersion: z.number().int().min(1),
+  schemaVersion: z.literal(DWRITE_SCHEMA_VERSION),
+  editorSchema: z.literal(DWRITE_EDITOR_SCHEMA),
   id: z.string().min(1),
   title: z.string(),
   content: jsonContentSchema,
@@ -56,6 +70,7 @@ export function createDocument(title = '未命名文档'): DeepWriteDocument {
   const now = new Date().toISOString();
   return {
     schemaVersion: DWRITE_SCHEMA_VERSION,
+    editorSchema: DWRITE_EDITOR_SCHEMA,
     id: crypto.randomUUID(),
     title,
     content: structuredClone(sampleContent),
@@ -63,6 +78,24 @@ export function createDocument(title = '未命名文档'): DeepWriteDocument {
     updatedAt: now,
     revision: 0,
     metadata: { language: 'zh-CN', tags: [] }
+  };
+}
+
+export function forkDocumentForSaveAs(document: DeepWriteDocument): DeepWriteDocument {
+  const now = new Date().toISOString();
+  const lineageId = typeof document.metadata.lineageId === 'string' && document.metadata.lineageId.trim()
+    ? document.metadata.lineageId
+    : document.id;
+  return {
+    ...document,
+    id: crypto.randomUUID(),
+    updatedAt: now,
+    metadata: {
+      ...document.metadata,
+      lineageId,
+      forkedFromDocumentId: document.id,
+      forkedAt: now
+    }
   };
 }
 
@@ -77,13 +110,20 @@ export function parseDocument(input: string): DeepWriteDocument {
   } catch {
     throw new Error('文件不是有效的 JSON，无法作为 DeepWrite 文档打开。');
   }
+  if (!parsed || typeof parsed !== 'object') throw new Error('文档结构无效：缺少文档对象。');
+  const version = (parsed as { schemaVersion?: unknown }).schemaVersion;
+  if (typeof version !== 'number' || !Number.isInteger(version)) throw new Error('文档结构无效：缺少有效的 schemaVersion。');
+  if (version > DWRITE_SCHEMA_VERSION) {
+    throw new Error(`该文档由更新版本的 DeepWrite 创建（schema ${version}）。`);
+  }
+  if (version === 1) {
+    const legacy = legacyV1Schema.safeParse(parsed);
+    if (!legacy.success) throw new Error(`文档结构无效：${legacy.error.issues[0]?.message ?? '未知错误'}`);
+    return deepWriteDocumentSchema.parse({ ...legacy.data, schemaVersion: DWRITE_SCHEMA_VERSION, editorSchema: DWRITE_EDITOR_SCHEMA });
+  }
+  if (version !== DWRITE_SCHEMA_VERSION) throw new Error(`不支持的旧版 DeepWrite 文档 schema：${version}。`);
   const result = deepWriteDocumentSchema.safeParse(parsed);
-  if (!result.success) {
-    throw new Error(`文档结构无效：${result.error.issues[0]?.message ?? '未知错误'}`);
-  }
-  if (result.data.schemaVersion > DWRITE_SCHEMA_VERSION) {
-    throw new Error(`该文档由更新版本的 DeepWrite 创建（schema ${result.data.schemaVersion}）。`);
-  }
+  if (!result.success) throw new Error(`文档结构无效：${result.error.issues[0]?.message ?? '未知错误'}`);
   return result.data;
 }
 

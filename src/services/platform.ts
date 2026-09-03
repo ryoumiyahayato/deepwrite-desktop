@@ -23,6 +23,10 @@ export async function readText(path: string): Promise<string> {
   return invokeCommand('read_text', { path });
 }
 
+export async function readTextIfExists(path: string): Promise<string | null> {
+  return invokeCommand<string | null>('read_text_if_exists', { path });
+}
+
 export async function readBinary(path: string): Promise<Uint8Array> {
   const bytes = await invokeCommand<number[]>('read_binary', { path });
   return new Uint8Array(bytes);
@@ -30,6 +34,10 @@ export async function readBinary(path: string): Promise<Uint8Array> {
 
 export async function atomicWriteText(path: string, contents: string): Promise<void> {
   await invokeCommand('atomic_write_text', { path, contents });
+}
+
+export async function compareAndSwapText(path: string, expectedContents: string | null, contents: string): Promise<void> {
+  await invokeCommand('compare_and_swap_text', { path, expectedContents, contents });
 }
 
 export async function atomicWriteBinary(path: string, contents: Uint8Array): Promise<void> {

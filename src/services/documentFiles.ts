@@ -3,27 +3,57 @@ import { marked } from 'marked';
 import TurndownService from 'turndown';
 import {
   createDocument,
+  forkDocumentForSaveAs,
   parseDocument,
   serializeDocument,
   type DeepWriteDocument
 } from '../domain/document';
+import { documentInstanceKey, normalizeDocumentPath } from '../domain/documentIdentity';
 import {
   atomicWriteBinary,
   atomicWriteText,
   chooseOpenPath,
   chooseSavePath,
+  compareAndSwapText,
   extensionFromPath,
   fileNameFromPath,
   invokeCommand,
   readBinary,
-  readText
+  readText,
+  readTextIfExists
 } from './platform';
 
 export type ImportedContent =
-  | { kind: 'document'; document: DeepWriteDocument; path: string; warnings: string[] }
+  | { kind: 'document'; document: DeepWriteDocument; path: string; diskContents: string; warnings: string[] }
   | { kind: 'html'; html: string; title: string; sourcePath: string; warnings: string[] };
 
+export interface SavedDwrite {
+  path: string;
+  document: DeepWriteDocument;
+  diskContents: string;
+}
+
+export interface RecoveredDwrite {
+  key: string;
+  document: DeepWriteDocument;
+}
+
+interface RecoveryPayload {
+  key: string;
+  contents: string;
+}
+
+const diskBaselines = new Map<string, string>();
 const htmlEscape = (input: string) => input.replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char] ?? char);
+
+function suggestedPath(directory: string, fileName: string): string {
+  const trimmed = directory.trim().replace(/[\\/]+$/, '');
+  return trimmed ? `${trimmed}\\${fileName}` : fileName;
+}
+
+export function sameDocumentPath(left: string | null, right: string | null): boolean {
+  return Boolean(left && right && normalizeDocumentPath(left) === normalizeDocumentPath(right));
+}
 
 export async function chooseAndOpenDocument(): Promise<ImportedContent | null> {
   const path = await chooseOpenPath(['dwrite', 'docx', 'txt', 'md', 'html', 'htm'], '写作文档');
@@ -32,7 +62,11 @@ export async function chooseAndOpenDocument(): Promise<ImportedContent | null> {
 
 export async function openDocumentAtPath(path: string): Promise<ImportedContent> {
   const extension = extensionFromPath(path);
-  if (extension === 'dwrite') return { kind: 'document', document: parseDocument(await readText(path)), path, warnings: [] };
+  if (extension === 'dwrite') {
+    const diskContents = await readText(path);
+    diskBaselines.set(normalizeDocumentPath(path), diskContents);
+    return { kind: 'document', document: parseDocument(diskContents), path, diskContents, warnings: [] };
+  }
   if (extension === 'docx') {
     const { importDocx } = await import('./docx');
     const imported = await importDocx(await readBinary(path));
@@ -48,17 +82,27 @@ export async function openDocumentAtPath(path: string): Promise<ImportedContent>
   throw new Error(`不支持的文件类型：.${extension}`);
 }
 
-function suggestedPath(directory: string, fileName: string): string {
-  const trimmed = directory.trim().replace(/[\\/]+$/, '');
-  return trimmed ? `${trimmed}\\${fileName}` : fileName;
-}
-
-export async function saveDwrite(document: DeepWriteDocument, currentPath: string | null, saveAs = false, defaultDirectory = ''): Promise<string | null> {
+export async function saveDwrite(
+  document: DeepWriteDocument,
+  currentPath: string | null,
+  saveAs = false,
+  defaultDirectory = ''
+): Promise<SavedDwrite | null> {
   let path = saveAs ? null : currentPath;
   if (!path) path = await chooseSavePath(suggestedPath(defaultDirectory, `${document.title || '未命名文档'}.dwrite`), ['dwrite'], 'DeepWrite 文档');
   if (!path) return null;
-  await atomicWriteText(path, serializeDocument(document));
-  return path;
+
+  const writingCurrentPath = sameDocumentPath(path, currentPath);
+  const isFork = saveAs && Boolean(currentPath) && !writingCurrentPath;
+  const savedDocument = isFork ? forkDocumentForSaveAs(document) : document;
+  const key = normalizeDocumentPath(path);
+  const targetBaseline = writingCurrentPath
+    ? (diskBaselines.get(key) ?? null)
+    : await readTextIfExists(path);
+  const diskContents = serializeDocument(savedDocument);
+  await compareAndSwapText(path, targetBaseline, diskContents);
+  diskBaselines.set(key, diskContents);
+  return { path, document: savedDocument, diskContents };
 }
 
 export async function exportDocument(
@@ -84,18 +128,42 @@ export async function exportDocument(
   return path;
 }
 
-export async function writeRecovery(document: DeepWriteDocument): Promise<void> {
-  await invokeCommand('write_recovery', { contents: serializeDocument(document) });
+export async function writeRecovery(document: DeepWriteDocument, path: string | null): Promise<void> {
+  await invokeCommand('write_recovery', {
+    documentId: documentInstanceKey(document.id, path),
+    contents: serializeDocument(document)
+  });
 }
 
-export async function readRecovery(): Promise<DeepWriteDocument | null> {
-  const contents = await invokeCommand<string | null>('read_recovery');
-  if (!contents) return null;
-  return parseDocument(contents);
+export function firstValidRecovery(payloads: RecoveryPayload[]): RecoveredDwrite | null {
+  for (const payload of payloads) {
+    try {
+      return { key: payload.key, document: parseDocument(payload.contents) };
+    } catch {
+      // A corrupt or future-schema recovery must not hide an older valid candidate.
+    }
+  }
+  return null;
 }
 
-export async function clearRecovery(): Promise<void> {
-  await invokeCommand('clear_recovery');
+export async function readRecovery(): Promise<RecoveredDwrite | null> {
+  return firstValidRecovery(await invokeCommand<RecoveryPayload[]>('read_recovery_candidates'));
+}
+
+export async function clearRecovery(documentId: string, path: string | null): Promise<void> {
+  await clearRecoveryKey(documentInstanceKey(documentId, path));
+}
+
+export async function clearRecoveryKey(key: string): Promise<void> {
+  await invokeCommand('clear_recovery', { documentId: key });
+}
+
+export async function startupDocumentPath(): Promise<string | null> {
+  return invokeCommand<string | null>('startup_document_path');
+}
+
+export async function takePendingOpenDocuments(): Promise<string[]> {
+  return invokeCommand<string[]>('take_pending_open_documents');
 }
 
 export function importedHtmlDocument(title: string, content: JSONContent): DeepWriteDocument {

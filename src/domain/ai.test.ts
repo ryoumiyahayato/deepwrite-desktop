@@ -14,13 +14,38 @@ describe('AI response validation and concurrency protection', () => {
     expect(aiResponseSchema.safeParse({ ...validResponse, suggestions: [{ ...validResponse.suggestions[0], severity: 'critical' }] }).success).toBe(false);
   });
 
-  it('hashes deterministically and marks changed targets stale', () => {
+  it('uses exact text plus document identity and revision for stale checks', () => {
     expect(stableHash('原文')).toBe(stableHash('原文'));
     const context = createSuggestionContext('doc-1', 7, 10, 16, '这里非常的安静');
     const suggestion = attachSuggestionContext(aiResponseSchema.parse(validResponse), context)[0];
-    expect(suggestion.targetFrom).toBe(12);
-    expect(isSuggestionStale(suggestion, '非常的安静', 'doc-1')).toBe(false);
-    expect(isSuggestionStale(suggestion, '已经被用户改写', 'doc-1')).toBe(true);
-    expect(isSuggestionStale(suggestion, '非常的安静', 'doc-2')).toBe(true);
+    expect(suggestion.relativeFrom).toBe(2);
+    expect(suggestion.relativeTo).toBe(7);
+    expect(isSuggestionStale(suggestion, '非常的安静', 'doc-1', 7)).toBe(false);
+    expect(isSuggestionStale(suggestion, '已经被用户改写', 'doc-1', 7)).toBe(true);
+    expect(isSuggestionStale(suggestion, '非常的安静', 'doc-2', 7)).toBe(true);
+    expect(isSuggestionStale(suggestion, '非常的安静', 'doc-1', 8)).toBe(true);
+  });
+
+  it('refuses ambiguous or cross-paragraph replacement anchors', () => {
+    const duplicateContext = createSuggestionContext('doc-1', 1, 1, 20, '安静，然后仍然安静');
+    const duplicate = aiResponseSchema.parse({
+      ...validResponse,
+      suggestions: [{ ...validResponse.suggestions[0], original: '安静' }]
+    });
+    expect(attachSuggestionContext(duplicate, duplicateContext)[0].relativeFrom).toBeNull();
+
+    const overlappingContext = createSuggestionContext('doc-1', 1, 1, 4, '哈哈哈');
+    const overlapping = aiResponseSchema.parse({
+      ...validResponse,
+      suggestions: [{ ...validResponse.suggestions[0], original: '哈哈' }]
+    });
+    expect(attachSuggestionContext(overlapping, overlappingContext)[0].relativeFrom).toBeNull();
+
+    const multilineContext = createSuggestionContext('doc-1', 1, 1, 20, '第一段\n第二段');
+    const multiline = aiResponseSchema.parse({
+      ...validResponse,
+      suggestions: [{ ...validResponse.suggestions[0], original: '第一段\n第二段' }]
+    });
+    expect(attachSuggestionContext(multiline, multilineContext)[0].relativeFrom).toBeNull();
   });
 });
