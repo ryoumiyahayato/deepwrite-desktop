@@ -13,7 +13,8 @@ This file records the release-critical invariants established by the Phase 1 har
 ## AI authority and privacy
 
 - AI output is non-authoritative until the user explicitly accepts or inserts it.
-- Replacement suggestions fail closed on document/revision mismatch, ambiguous anchors, invalid structured positions, or exact source-text mismatch.
+- Replacement suggestions fail closed on document/revision mismatch, ambiguous anchors (including overlapping duplicates), invalid structured positions, or exact source-text mismatch.
+- Any AI mutation that awaits an asynchronous version snapshot revalidates the current document session and target/context after that await and immediately before modifying editor content.
 - Continuation generation is a separate insertion flow and cannot be inserted after the source revision changes.
 - Ordinary AI actions use bounded selection/recent context.
 - Logic review, contradiction detection, and character-consistency review are full-document diagnostics. Before any diagnostic request is sent, the user must see and confirm the exact overlapping batch plan that will be sent to the configured DeepSeek API. Cancelling the disclosure sends nothing for that run.
