@@ -103,7 +103,7 @@ jobs:
           - The application does not include a DeepSeek API key; users configure their own key inside Settings.
           - This build is currently unsigned, so Windows may show an Unknown Publisher / SmartScreen warning.
           - A SHA-256 checksum file is attached next to the installer.
-'@ | Set-Content release-notes.md -Encoding utf8
+          '@ | Set-Content release-notes.md -Encoding utf8
 
           gh release create $env:RELEASE_TAG `
             --repo $env:GITHUB_REPOSITORY `
