@@ -1,0 +1,116 @@
+name: Publish DeepWrite Windows preview
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/publish-windows-preview.yml'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: deepwrite-windows-preview-release
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install JavaScript dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Read app version
+        shell: pwsh
+        run: |
+          $version = (Get-Content package.json -Raw | ConvertFrom-Json).version
+          if (-not $version) { throw "Unable to read version from package.json" }
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_TAG=deepwrite-v$version-windows-preview" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "INSTALLER_NAME=DeepWrite-$version-Windows-x64-Setup.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build NSIS installer
+        run: pnpm tauri build --bundles nsis
+
+      - name: Validate Windows installer
+        run: pnpm validate:windows-artifact
+
+      - name: Prepare release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $installers = @(Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Filter "*.exe" -File)
+          if ($installers.Count -ne 1) {
+            throw "Expected exactly one NSIS installer, found $($installers.Count)"
+          }
+          Copy-Item $installers[0].FullName "dist/$env:INSTALLER_NAME"
+          $hash = (Get-FileHash "dist/$env:INSTALLER_NAME" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $env:INSTALLER_NAME" | Set-Content "dist/$env:INSTALLER_NAME.sha256" -Encoding ascii
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeepWrite-${{ env.VERSION }}-Windows-x64-preview
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            dist/${{ env.INSTALLER_NAME }}
+            dist/${{ env.INSTALLER_NAME }}.sha256
+
+      - name: Publish GitHub prerelease
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          gh release view $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release delete $env:RELEASE_TAG --repo $env:GITHUB_REPOSITORY --cleanup-tag --yes
+            if ($LASTEXITCODE -ne 0) { throw "Failed to replace existing preview release" }
+          }
+
+          @'
+          ## DeepWrite Windows preview
+
+          This is a Windows x64 preview installer built from the current `main` branch.
+
+          - NSIS installer for Windows 10/11 x64.
+          - Bundles the WebView2 Evergreen Offline Installer as configured by the project.
+          - Uses per-user installation mode and does not require administrator rights merely to install DeepWrite.
+          - The application does not include a DeepSeek API key; users configure their own key inside Settings.
+          - This build is currently unsigned, so Windows may show an Unknown Publisher / SmartScreen warning.
+          - A SHA-256 checksum file is attached next to the installer.
+'@ | Set-Content release-notes.md -Encoding utf8
+
+          gh release create $env:RELEASE_TAG `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
+            --title "DeepWrite $env:VERSION Windows Preview" `
+            --notes-file release-notes.md `
+            --prerelease `
+            "dist/$env:INSTALLER_NAME" `
+            "dist/$env:INSTALLER_NAME.sha256"
+          if ($LASTEXITCODE -ne 0) { throw "Failed to create GitHub release" }
